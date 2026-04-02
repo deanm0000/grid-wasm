@@ -181,6 +181,53 @@ impl CanvasCtx {
         // Direction is handled at the fillText level instead
     }
 
+    // --- Snapshot / compositing ---
+
+    pub fn capture_rect(
+        &self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) -> Result<web_sys::HtmlCanvasElement, JsValue> {
+        let doc = web_sys::window()
+            .ok_or("no window")?
+            .document()
+            .ok_or("no document")?;
+        let offscreen = doc
+            .create_element("canvas")?
+            .dyn_into::<web_sys::HtmlCanvasElement>()?;
+        offscreen.set_width(w.ceil() as u32);
+        offscreen.set_height(h.ceil() as u32);
+        let off_ctx = offscreen
+            .get_context("2d")?
+            .ok_or("no 2d ctx")?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        let source_canvas = self
+            .ctx
+            .canvas()
+            .ok_or("no canvas")?
+            .dyn_into::<web_sys::HtmlCanvasElement>()?;
+        off_ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+            &source_canvas,
+            x, y, w, h,
+            0.0, 0.0, w, h,
+        )?;
+        Ok(offscreen)
+    }
+
+    pub fn draw_canvas_at(
+        &self,
+        source: &web_sys::HtmlCanvasElement,
+        x: f64,
+        y: f64,
+    ) {
+        let _ = self
+            .ctx
+            .draw_image_with_html_canvas_element(source, x, y);
+    }
+
     // --- Direct access for when the wrapper doesn't suffice ---
     pub fn raw(&self) -> &CanvasRenderingContext2d {
         &self.ctx

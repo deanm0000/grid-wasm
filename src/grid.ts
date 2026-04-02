@@ -137,6 +137,7 @@ export interface DataGridOptions {
   freezeTrailingRows?: number;
   theme?: Theme;
   initialSortState?: SortState;
+  swapAnimationDuration?: number;
 }
 
 let wasmReady: Promise<any> | null = null;
@@ -164,6 +165,7 @@ export class WasmDataGrid {
   private mouseDownCtrl = false;
   private colDragChip: HTMLDivElement | null = null;
   private wasColDragging = false;
+  private animFrameId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement, options: DataGridOptions) {
     this.canvas = canvas;
@@ -181,7 +183,7 @@ export class WasmDataGrid {
   private async configure(): Promise<void> {
     if (!this.grid) return;
 
-    const { data, columns, columnOverrides, headerHeight, rowHeight, freezeColumns, freezeTrailingRows, theme, initialSortState } = this.options;
+    const { data, columns, columnOverrides, headerHeight, rowHeight, freezeColumns, freezeTrailingRows, theme, initialSortState, swapAnimationDuration } = this.options;
 
     if (columns && columnOverrides) {
       throw new Error("Cannot specify both 'columns' and 'columnOverrides'");
@@ -192,6 +194,7 @@ export class WasmDataGrid {
     if (rowHeight !== undefined) this.grid.set_row_height(rowHeight);
     if (freezeColumns !== undefined) this.grid.set_freeze_columns(freezeColumns);
     if (freezeTrailingRows !== undefined) this.grid.set_freeze_trailing_rows(freezeTrailingRows);
+    if (swapAnimationDuration !== undefined) this.grid.set_swap_animation_duration(swapAnimationDuration);
     if (theme) this.grid.set_theme(theme);
 
     if (columns) {
@@ -314,7 +317,12 @@ export class WasmDataGrid {
         if (this.grid.is_col_drag_active()) {
           this.showColDragChip(e.clientX, e.clientY);
         }
-        this.grid.render();
+
+        if (cursor === 'col-swap') {
+          this.startAnimLoop();
+        } else {
+          this.grid.render();
+        }
         return;
       }
 
@@ -432,6 +440,20 @@ export class WasmDataGrid {
       this.colDragChip.remove();
       this.colDragChip = null;
     }
+  }
+
+  private startAnimLoop(): void {
+    if (this.animFrameId !== null) return;
+    const tick = () => {
+      if (!this.grid) { this.animFrameId = null; return; }
+      this.grid.render();
+      if (this.grid.is_animating()) {
+        this.animFrameId = requestAnimationFrame(tick);
+      } else {
+        this.animFrameId = null;
+      }
+    };
+    this.animFrameId = requestAnimationFrame(tick);
   }
 
   async setData(data: DataSource): Promise<void> {

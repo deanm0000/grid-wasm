@@ -314,6 +314,10 @@ impl DataGrid {
         self.state.freeze_trailing_rows = n;
     }
 
+    pub fn set_swap_animation_duration(&mut self, ms: f64) {
+        self.state.swap_animation_duration_ms = ms;
+    }
+
     /// Set the theme as a JSON object matching the Theme struct.
     pub fn set_theme(&mut self, theme: JsValue) -> Result<(), JsValue> {
         let t: theme::Theme = serde_wasm_bindgen::from_value(theme)?;
@@ -463,21 +467,32 @@ impl DataGrid {
 
     pub fn on_mouse_move(&mut self, x: f64, y: f64) -> String {
         // Column drag tracking
-        if let Some(ref mut cd) = self.state.col_drag {
-            cd.prev_mouse_x = cd.mouse_x;
-            cd.mouse_x = x;
-            cd.mouse_y = y;
-            if !cd.has_activated {
-                let dx = (x - cd.start_x).abs();
-                if dx > 8.0 {
-                    cd.has_activated = true;
+        if self.state.col_drag.is_some() {
+            {
+                let cd = self.state.col_drag.as_mut().unwrap();
+                cd.prev_mouse_x = cd.mouse_x;
+                cd.mouse_x = x;
+                cd.mouse_y = y;
+                if !cd.has_activated {
+                    let dx = (x - cd.start_x).abs();
+                    if dx > 8.0 {
+                        cd.has_activated = true;
+                    }
                 }
             }
-            if cd.has_activated {
-                self.check_col_swap(x);
+
+            let activated = self.state.col_drag.as_ref().unwrap().has_activated;
+            if activated {
+                if let Some((a, b)) = self.detect_col_swap(x) {
+                    self.perform_col_swap(a, b);
+                    return "col-swap".to_string();
+                }
             }
             return "grabbing".to_string();
         }
+
+        // Clean up finished animations lazily
+        self.state.clean_finished_animation();
 
         let effective = self.state.effective_columns();
         let hh = self.state.header_height;
@@ -501,16 +516,10 @@ impl DataGrid {
         "default".to_string()
     }
 
-    /// Check if dragged column should swap with a neighbor.
-    /// Only allows swaps in the current drag direction to prevent oscillation.
-    fn check_col_swap(&mut self, mouse_x: f64) {
-        let (drag_col, moving_right) = match &self.state.col_drag {
-            Some(cd) => {
-                let dir = cd.mouse_x - cd.prev_mouse_x;
-                (cd.col_display_index, dir >= 0.0)
-            }
-            None => return,
-        };
+    fn detect_col_swap(&self, mouse_x: f64) -> Option<(usize, usize)> {
+        let cd = self.state.col_drag.as_ref()?;
+        let drag_col = cd.col_display_index;
+        let moving_right = cd.mouse_x - cd.prev_mouse_x >= 0.0;
 
         let mapped = &self.state.mapped_columns;
         let tx = self.state.translate_x;
@@ -523,37 +532,74 @@ impl DataGrid {
             x_acc += c.width;
         }
 
-        let drag_pos = col_positions.iter().position(|(si, _, _)| *si == drag_col);
-        let drag_pos = match drag_pos {
-            Some(p) => p,
-            None => return,
-        };
+        let drag_pos = col_positions.iter().position(|(si, _, _)| *si == drag_col)?;
 
-        // Only check right neighbor when moving right
         if moving_right && drag_pos + 1 < col_positions.len() {
             let (neighbor_si, neighbor_x, neighbor_w) = col_positions[drag_pos + 1];
             let threshold = neighbor_x + neighbor_w * 0.1;
             if mouse_x > threshold {
-                self.start_col_swap(drag_col, neighbor_si);
-                return;
+                return Some((drag_col, neighbor_si));
             }
         }
 
-        // Only check left neighbor when moving left
         if !moving_right && drag_pos > 0 {
             let (neighbor_si, neighbor_x, neighbor_w) = col_positions[drag_pos - 1];
             let threshold = neighbor_x + neighbor_w * 0.9;
             if mouse_x < threshold {
-                self.start_col_swap(drag_col, neighbor_si);
-                return;
+                return Some((drag_col, neighbor_si));
             }
         }
+
+        None
     }
 
-    fn start_col_swap(&mut self, a: usize, b: usize) {
+    fn perform_col_swap(&mut self, a: usize, b: usize) {
+        use crate::types::ColSlideAnimation;
+
+        // Fast-forward any existing animation
+        self.state.col_slide_anim = None;
+
+        let hh = self.state.header_height;
+        let ghh = self.state.group_header_height;
+        let (leaf_y, _leaf_h) = render::header::leaf_row_geometry(
+            hh, ghh, self.state.resolved_columns.as_ref(),
+        );
+        let canvas_h = self.state.height;
+        let capture_y = leaf_y;
+        let capture_h = canvas_h - leaf_y;
+
+        // Find pixel positions of both columns before swap
+        let tx = self.state.translate_x;
+        let mut a_x = 0.0f64;
+        let mut a_w = 0.0f64;
+        let mut b_x = 0.0f64;
+        let mut b_w = 0.0f64;
+        {
+            let mut x_acc = 0.0f64;
+            for c in &self.state.mapped_columns {
+                let draw_x = if c.sticky { x_acc } else { x_acc + tx };
+                if c.source_index == a {
+                    a_x = draw_x;
+                    a_w = c.width;
+                }
+                if c.source_index == b {
+                    b_x = draw_x;
+                    b_w = c.width;
+                }
+                x_acc += c.width;
+            }
+        }
+
+        // Capture pre-swap column strips
+        let canvas_a = self.state.canvas.as_ref()
+            .and_then(|ctx| ctx.capture_rect(a_x, capture_y, a_w, capture_h).ok());
+        let canvas_b = self.state.canvas.as_ref()
+            .and_then(|ctx| ctx.capture_rect(b_x, capture_y, b_w, capture_h).ok());
+
+        // Commit the swap
         self.state.swap_columns(a, b);
 
-        // Update drag state: the dragged column swapped position
+        // Update drag state
         if let Some(ref mut cd) = self.state.col_drag {
             if cd.col_display_index == a {
                 cd.col_display_index = b;
@@ -561,6 +607,28 @@ impl DataGrid {
                 cd.col_display_index = a;
             }
         }
+
+        // Render post-swap state (headers + data all correct)
+        self.state.render();
+
+        // Start slide animation (the captured pre-swap strips slide to new positions)
+        if let (Some(ca), Some(cb)) = (canvas_a, canvas_b) {
+            self.state.col_slide_anim = Some(ColSlideAnimation {
+                canvas_a: ca,
+                canvas_b: cb,
+                a_start_x: a_x,
+                b_start_x: b_x,
+                a_end_x: b_x,
+                b_end_x: a_x,
+                y: capture_y,
+                start_time_ms: js_sys::Date::now(),
+                duration_ms: self.state.swap_animation_duration_ms,
+            });
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.state.col_slide_anim.is_some()
     }
 
     /// Returns "resize", "drag", or "none".

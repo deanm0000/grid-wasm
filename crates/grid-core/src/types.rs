@@ -372,6 +372,29 @@ pub struct ColDragState {
     pub has_activated: bool,
 }
 
+pub struct ColSlideAnimation {
+    pub canvas_a: web_sys::HtmlCanvasElement,
+    pub canvas_b: web_sys::HtmlCanvasElement,
+    pub a_start_x: f64,
+    pub b_start_x: f64,
+    pub a_end_x: f64,
+    pub b_end_x: f64,
+    pub y: f64,
+    pub start_time_ms: f64,
+    pub duration_ms: f64,
+}
+
+impl ColSlideAnimation {
+    pub fn progress_at(&self, now_ms: f64) -> f64 {
+        let t = ((now_ms - self.start_time_ms) / self.duration_ms).clamp(0.0, 1.0);
+        if t < 0.5 { 2.0 * t * t } else { -1.0 + (4.0 - 2.0 * t) * t }
+    }
+
+    pub fn is_done(&self, now_ms: f64) -> bool {
+        now_ms >= self.start_time_ms + self.duration_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortDirection {

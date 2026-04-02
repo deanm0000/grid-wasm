@@ -3,7 +3,7 @@ use crate::canvas::CanvasCtx;
 use crate::columns::{normalize_columns, resolve_columns, ResolvedColumns};
 use crate::render::header::GroupDetails;
 use crate::theme::Theme;
-use crate::types::{ColDragState, ColumnInput, GridCell, GridColumn, GridSelection, Item, ResizeState, SortState};
+use crate::types::{ColDragState, ColSlideAnimation, ColumnInput, GridCell, GridColumn, GridSelection, Item, ResizeState, SortState};
 use crate::walk::MappedColumn;
 
 pub struct GridState {
@@ -46,6 +46,8 @@ pub struct GridState {
     pub drag_start: Option<Item>,
 
     pub col_drag: Option<ColDragState>,
+    pub col_slide_anim: Option<ColSlideAnimation>,
+    pub swap_animation_duration_ms: f64,
 }
 
 impl GridState {
@@ -84,6 +86,8 @@ impl GridState {
             resize_hover_col: None,
             drag_start: None,
             col_drag: None,
+            col_slide_anim: None,
+            swap_animation_duration_ms: 250.0,
         }
     }
 
@@ -446,5 +450,27 @@ impl GridState {
             resize_state.as_ref(),
             col_drag.as_ref(),
         );
+
+        // Paint slide animation on top of the rendered grid
+        if let Some(ref anim) = self.col_slide_anim {
+            let now = js_sys::Date::now();
+            if anim.is_done(now) {
+                // Will be cleared by the caller after render returns
+            } else {
+                let p = anim.progress_at(now);
+                let ax = anim.a_start_x * (1.0 - p) + anim.a_end_x * p;
+                let bx = anim.b_start_x * (1.0 - p) + anim.b_end_x * p;
+                ctx.draw_canvas_at(&anim.canvas_a, ax, anim.y);
+                ctx.draw_canvas_at(&anim.canvas_b, bx, anim.y);
+            }
+        }
+    }
+
+    pub fn clean_finished_animation(&mut self) {
+        if let Some(ref anim) = self.col_slide_anim {
+            if anim.is_done(js_sys::Date::now()) {
+                self.col_slide_anim = None;
+            }
+        }
     }
 }
