@@ -1,13 +1,13 @@
 use crate::canvas::CanvasCtx;
+use crate::columns::ResolvedColumns;
 use crate::theme::Theme;
-use crate::types::{GridCell, GridSelection, Rectangle};
+use crate::types::{ColDragState, GridCell, GridSelection, ResizeState, SortState};
 use crate::walk::MappedColumn;
 
 use super::cells::draw_cells;
 use super::header::{draw_grid_headers, GroupDetails};
 use super::lines::{draw_blanks, draw_grid_lines, draw_selection_ring};
 
-/// Main render function. Orchestrates all drawing operations.
 pub fn draw_grid(
     ctx: &mut CanvasCtx,
     width: f64,
@@ -19,28 +19,30 @@ pub fn draw_grid(
     header_height: f64,
     group_header_height: f64,
     enable_groups: bool,
-    cell_x_offset: usize,
+    _cell_x_offset: usize,
     cell_y_offset: usize,
     translate_x: f64,
     translate_y: f64,
-    freeze_columns: usize,
+    _freeze_columns: usize,
     freeze_trailing_rows: usize,
     has_append_row: bool,
     selection: &GridSelection,
+    sort_state: &SortState,
     theme: &Theme,
     is_focused: bool,
     draw_focus: bool,
     get_cell_content: &dyn Fn(i32, i32) -> GridCell,
     get_group_details: &dyn Fn(&str) -> GroupDetails,
-    vertical_border: &dyn Fn(usize) -> bool,
+    _vertical_border: &dyn Fn(usize) -> bool,
+    resolved_columns: Option<&ResolvedColumns>,
+    resize_state: Option<&ResizeState>,
+    col_drag: Option<&ColDragState>,
 ) {
     let total_header_height = header_height + group_header_height;
 
-    // 1. Clear and fill background
     ctx.set_fill_style(&theme.bg_cell);
     ctx.fill_rect(0.0, 0.0, width, height);
 
-    // 2. Draw grid lines
     draw_grid_lines(
         ctx,
         effective_cols,
@@ -52,13 +54,12 @@ pub fn draw_grid(
         cell_y_offset,
         rows,
         row_height,
-        freeze_columns,
+        0,
         freeze_trailing_rows,
         theme,
         has_append_row,
     );
 
-    // 3. Draw headers
     draw_grid_headers(
         ctx,
         effective_cols,
@@ -68,12 +69,14 @@ pub fn draw_grid(
         header_height,
         group_header_height,
         selection,
+        sort_state,
         theme,
-        vertical_border,
+        |_| true,
         get_group_details,
+        resolved_columns,
+        col_drag,
     );
 
-    // 4. Draw cells
     draw_cells(
         ctx,
         effective_cols,
@@ -91,9 +94,9 @@ pub fn draw_grid(
         theme,
         is_focused,
         draw_focus,
+        resolved_columns,
     );
 
-    // 5. Draw blanks (area to the right of data)
     draw_blanks(
         ctx,
         effective_cols,
@@ -112,7 +115,6 @@ pub fn draw_grid(
         theme,
     );
 
-    // 6. Draw selection ring
     if selection.current.is_some() {
         draw_selection_ring(
             ctx,
@@ -131,5 +133,52 @@ pub fn draw_grid(
             theme,
             is_focused,
         );
+    }
+
+    if let Some(rs) = resize_state {
+        draw_resize_indicators(ctx, rs, effective_cols, translate_x, total_header_height, height);
+    }
+}
+
+fn draw_resize_indicators(
+    ctx: &CanvasCtx,
+    rs: &ResizeState,
+    effective_cols: &[MappedColumn],
+    translate_x: f64,
+    top: f64,
+    bottom: f64,
+) {
+    let mut x = 0.0f64;
+    let mut clip_x = 0.0f64;
+    let mut left_x = None;
+
+    for c in effective_cols {
+        let draw_x = if c.sticky { clip_x } else { x + translate_x };
+        if c.source_index == rs.column_display_index {
+            left_x = Some(draw_x);
+            break;
+        }
+        x += c.width;
+        if c.sticky {
+            clip_x += c.width;
+        }
+    }
+
+    if let Some(lx) = left_x {
+        let new_width = (rs.start_width + (rs.current_x - rs.start_x)).max(30.0);
+        let right_x = lx + new_width;
+
+        ctx.set_stroke_style("#000000");
+        ctx.set_line_width(1.0);
+
+        ctx.begin_path();
+        ctx.move_to(lx + 0.5, top);
+        ctx.line_to(lx + 0.5, bottom);
+        ctx.stroke();
+
+        ctx.begin_path();
+        ctx.move_to(right_x + 0.5, top);
+        ctx.line_to(right_x + 0.5, bottom);
+        ctx.stroke();
     }
 }

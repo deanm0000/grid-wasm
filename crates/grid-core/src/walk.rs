@@ -7,7 +7,9 @@ pub struct MappedColumn {
     pub group: Option<String>,
     pub icon: Option<String>,
     pub source_index: usize,
+    pub arrow_index: usize,
     pub sticky: bool,
+    pub is_resizable: bool,
 }
 
 impl MappedColumn {
@@ -18,7 +20,9 @@ impl MappedColumn {
             group: col.group.clone(),
             icon: col.icon.clone(),
             source_index,
+            arrow_index: source_index,
             sticky,
+            is_resizable: true,
         }
     }
 }

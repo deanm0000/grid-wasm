@@ -158,17 +158,17 @@ fn is_rtl_text(s: &str) -> bool {
 
 /// Check if a cell is selected in the current selection.
 pub fn cell_is_selected(col: usize, row: i32, selection: &GridSelection) -> bool {
+    // Check primary range
     if let Some(ref current) = selection.current {
-        if current.cell.col == col as i32 && current.cell.row == row {
-            return true;
-        }
-        // Check range
         let r = &current.range;
-        (col as f64) >= r.x
+        if (col as f64) >= r.x
             && (col as f64) < r.x + r.width
             && (row as f64) >= r.y
             && (row as f64) < r.y + r.height
-    } else {
-        false
+        {
+            return true;
+        }
     }
+    // Check ctrl_cells (non-contiguous)
+    selection.ctrl_cells.iter().any(|i| i.col == col as i32 && i.row == row)
 }

@@ -138,12 +138,41 @@ pub struct GridSelection {
     pub current: Option<CurrentSelection>,
     pub columns: Vec<i32>,
     pub rows: Vec<i32>,
+    /// Non-contiguous additional cells from Ctrl+Click.
+    #[serde(default)]
+    pub ctrl_cells: Vec<Item>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentSelection {
+    /// The anchor cell (where shift-extend and drag started from).
     pub cell: Item,
+    /// The selected range. For a single cell: width=1, height=1.
+    /// For a drag or shift+click: spans from anchor to the opposite corner.
     pub range: Rectangle,
+}
+
+impl GridSelection {
+    pub fn single(col: i32, row: i32) -> Self {
+        Self {
+            current: Some(CurrentSelection {
+                cell: Item::new(col, row),
+                range: Rectangle::new(col as f64, row as f64, 1.0, 1.0),
+            }),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            ctrl_cells: Vec::new(),
+        }
+    }
+
+    pub fn is_multi(&self) -> bool {
+        if let Some(ref cur) = self.current {
+            if cur.range.width > 1.0 || cur.range.height > 1.0 {
+                return true;
+            }
+        }
+        !self.ctrl_cells.is_empty()
+    }
 }
 
 impl Default for GridSelection {
@@ -152,6 +181,7 @@ impl Default for GridSelection {
             current: None,
             columns: Vec::new(),
             rows: Vec::new(),
+            ctrl_cells: Vec::new(),
         }
     }
 }
@@ -221,4 +251,207 @@ impl CompactSelection {
 pub enum GridColumnMenuIcon {
     Triangle,
     Dots,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum NumberFormat {
+    Accounting {
+        #[serde(default = "default_two")]
+        decimals: u32,
+    },
+    Currency {
+        #[serde(default = "default_dollar")]
+        symbol: String,
+        #[serde(default = "default_two")]
+        decimals: u32,
+    },
+    Percent {
+        #[serde(default = "default_one")]
+        decimals: u32,
+    },
+    Decimal {
+        #[serde(default = "default_two")]
+        decimals: u32,
+    },
+    Integer,
+    Date {
+        #[serde(default = "default_date_format")]
+        format: String,
+    },
+}
+
+fn default_two() -> u32 { 2 }
+fn default_one() -> u32 { 1 }
+fn default_dollar() -> String { "$".to_string() }
+fn default_date_format() -> String { "%Y-%m-%d".to_string() }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ConditionalRule {
+    GreaterThan { value: f64, style: CellStyleOverride },
+    LessThan { value: f64, style: CellStyleOverride },
+    Equal { value: f64, style: CellStyleOverride },
+    Between { min: f64, max: f64, style: CellStyleOverride },
+    Contains { value: String, style: CellStyleOverride },
+    IsNull { style: CellStyleOverride },
+    IsNotNull { style: CellStyleOverride },
+    Percentile {
+        #[serde(default = "default_low_pct")]
+        low: f64,
+        #[serde(default = "default_high_pct")]
+        high: f64,
+        low_style: CellStyleOverride,
+        mid_style: Option<CellStyleOverride>,
+        high_style: CellStyleOverride,
+    },
+}
+
+fn default_low_pct() -> f64 { 0.25 }
+fn default_high_pct() -> f64 { 0.75 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellStyleOverride {
+    pub color: Option<String>,
+    pub bg_color: Option<String>,
+    pub font: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderStyle {
+    pub font: Option<String>,
+    pub color: Option<String>,
+    pub bg_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStyle {
+    pub font: Option<String>,
+    pub color: Option<String>,
+    pub bg_color: Option<String>,
+    pub align: Option<ContentAlign>,
+    pub number_format: Option<NumberFormat>,
+    pub conditional_formats: Option<Vec<ConditionalRule>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnInput {
+    pub name: Option<String>,
+    pub display: Option<String>,
+    pub init_width: Option<f64>,
+    #[serde(default = "default_true")]
+    pub is_resizable: bool,
+    pub header_style: Option<HeaderStyle>,
+    pub data_style: Option<DataStyle>,
+    pub children: Option<Vec<ColumnInput>>,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Debug, Clone)]
+pub struct ResizeState {
+    pub column_display_index: usize,
+    pub start_x: f64,
+    pub start_width: f64,
+    pub current_x: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColDragState {
+    pub col_display_index: usize,
+    pub col_title: String,
+    pub start_x: f64,
+    pub start_y: f64,
+    pub mouse_x: f64,
+    pub mouse_y: f64,
+    pub prev_mouse_x: f64,
+    pub has_activated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SortState {
+    pub column: Option<usize>,
+    pub direction: Option<SortDirection>,
+}
+
+#[cfg(test)]
+mod col_tests {
+    use super::*;
+    use crate::columns::{normalize_columns, resolve_columns};
+
+    #[test]
+    fn test_column_input_deser() {
+        let json = r#####"[
+          {
+            "display": "Financials",
+            "headerStyle": {"bgColor": "#E8EAF6", "color": "#283593"},
+            "children": [
+              {
+                "name": "price",
+                "display": "Price",
+                "initWidth": 120,
+                "dataStyle": {
+                  "numberFormat": {"type": "currency", "symbol": "$", "decimals": 2},
+                  "align": "right"
+                }
+              }
+            ]
+          }
+        ]"#####;
+        let result: Result<Vec<ColumnInput>, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "deser failed: {:?}", result.err());
+        let cols = result.unwrap();
+        assert_eq!(cols[0].display.as_deref(), Some("Financials"));
+    }
+
+    #[test]
+    fn test_resolve_columns() {
+        let json = r#####"[
+          {"display": "Descriptions", "children": [
+            {"name": "id", "display": "ID", "initWidth": 80},
+            {"name": "name", "display": "Product Name", "initWidth": 200}
+          ]},
+          {"display": "Financials", "children": [
+            {"name": "price", "display": "Price", "initWidth": 120}
+          ]}
+        ]"#####;
+        let inputs: Vec<ColumnInput> = serde_json::from_str(json).unwrap();
+        let data_cols = vec!["id".to_string(), "name".to_string(), "price".to_string()];
+        let normalized = normalize_columns(Some(&inputs), None, &data_cols).unwrap();
+        let resolved = resolve_columns(&normalized, &data_cols, 150.0, 1.0);
+        assert!(resolved.is_ok(), "resolve failed: {:?}", resolved.err());
+        let r = resolved.unwrap();
+        assert_eq!(r.max_depth, 2);
+        assert_eq!(r.leaves.len(), 3);
+        assert_eq!(r.leaves[0].display_name, "ID");
+        assert_eq!(r.leaves[1].display_name, "Product Name");
+        assert_eq!(r.leaves[2].display_name, "Price");
+    }
+
+    #[test]
+    fn test_conditional_format_deser() {
+        let json = r#####"[
+          {"display": "Financials", "children": [
+            {"name": "qty", "display": "Qty", "dataStyle": {
+              "numberFormat": {"type": "integer"},
+              "conditionalFormats": [
+                {"type": "greaterThan", "value": 5000, "style": {"bgColor": "#C8E6C9", "color": "#1B5E20"}}
+              ]
+            }}
+          ]}
+        ]"#####;
+        let result: Result<Vec<ColumnInput>, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "deser failed: {:?}", result.err());
+    }
 }
