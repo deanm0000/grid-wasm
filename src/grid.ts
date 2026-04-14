@@ -429,6 +429,16 @@ export class WasmDataGrid {
         }
         e.preventDefault();
         e.stopPropagation();
+      } else if (result === 'header-expand-toggle') {
+        const col = this.grid.get_last_expand_row();
+        if (col >= 0) {
+          e.preventDefault();
+          this.grid.toggle_header_expand(col).then(() => {
+            this.grid!.render();
+            this.updateScrollbars();
+            this.fetchVisibleExpandRows();
+          }).catch((e: unknown) => console.error('header expand failed:', e));
+        }
       } else if (result === 'expand-toggle') {
         const row = this.grid.get_last_expand_row();
         if (row >= 0) {
@@ -563,6 +573,7 @@ export class WasmDataGrid {
       this.grid.on_scroll(e.deltaX, e.deltaY);
       this.grid.render();
       this.updateScrollbars();
+      this.fetchVisibleExpandRows();
     }, { passive: false });
 
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -758,6 +769,16 @@ export class WasmDataGrid {
 
     this.scrollCorner.style.left = `${rect.right}px`;
     this.scrollCorner.style.top = `${rect.bottom}px`;
+  }
+
+  private fetchVisibleExpandRows(): void {
+    if (!this.grid) return;
+    this.grid.fetch_visible_expand_rows().then((hadPending: boolean) => {
+      if (hadPending) {
+        this.grid!.render();
+        this.updateScrollbars();
+      }
+    }).catch(() => {});
   }
 
   private updateScrollbars(): void {

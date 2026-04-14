@@ -104,6 +104,9 @@ pub struct GridState {
     pub raw_col_mappings: Vec<RawColMapping>,
     /// Row index of the most recently hit expand toggle (set by on_mouse_down).
     pub pending_expand_row: Option<usize>,
+    /// Combined group_by(all_keys) result cached for lazy in-memory partitioning.
+    /// Populated during expand-all; cleared when group keys change or collapse-all.
+    pub lazy_combined_data: Option<ArrowDataSource>,
 }
 
 impl GridState {
@@ -164,6 +167,7 @@ impl GridState {
             group_key_display_cols: Vec::new(),
             raw_col_mappings: Vec::new(),
             pending_expand_row: None,
+            lazy_combined_data: None,
         }
     }
 
@@ -843,7 +847,15 @@ impl GridState {
         self.run_group_by_query(col_width).await
     }
 
+     pub async fn run_group_by_query_preserve_expand(&mut self, col_width: f64) -> Result<(), String> {
+        self.run_group_by_query_inner(col_width, true).await
+    }
+
      pub async fn run_group_by_query(&mut self, col_width: f64) -> Result<(), String> {
+        self.run_group_by_query_inner(col_width, false).await
+    }
+
+     async fn run_group_by_query_inner(&mut self, col_width: f64, preserve_expand: bool) -> Result<(), String> {
         let data = self.arrow_data.as_ref().ok_or("No data loaded")?;
         // Group by only the first key at the top level. Deeper levels are fetched
         // on demand via filter_raw → group_by(remaining_keys) when the user expands.
@@ -895,8 +907,11 @@ impl GridState {
         self.column_overrides = None;
         self.configure_columns(&grouped_schema_names, col_width)?;
 
-        self.expand_caches.clear();
-        self.expanded_keys.clear();
+        if !preserve_expand {
+            self.expand_caches.clear();
+            self.expanded_keys.clear();
+            self.lazy_combined_data = None;
+        }
         self.pending_expand_row = None;
         self.rebuild_expand_metadata();
         self.rebuild_virtual_rows();
@@ -912,6 +927,7 @@ impl GridState {
         self.virtual_rows.clear();
         self.expand_caches.clear();
         self.expanded_keys.clear();
+        self.lazy_combined_data = None;
         self.group_key_display_cols.clear();
         self.raw_col_mappings.clear();
 
@@ -1043,7 +1059,7 @@ impl GridState {
         if !self.expanded_keys.contains(row_cache_key) { return; }
 
         let next_depth = depth + 1;
-        let is_leaf = next_depth >= n_keys; // next level would be raw rows
+        let is_leaf = next_depth >= n_keys;
 
         if let Some(child_data) = self.expand_caches.get(row_cache_key) {
             let n_children = child_data.num_rows();
@@ -1056,6 +1072,9 @@ impl GridState {
                     self.append_children(rows, &child_key, next_depth, n_keys);
                 }
             }
+        } else {
+            // Cache not populated yet — insert a single Pending placeholder.
+            rows.push(VirtualRowRef::Pending { cache_key: row_cache_key.clone(), depth: next_depth });
         }
     }
 
@@ -1094,7 +1113,7 @@ impl GridState {
 
         let (row_depth, row_idx, parent_cache_key) = match &vrow {
             VirtualRowRef::Aggregate { depth, row_idx, cache_key } => (*depth, *row_idx, cache_key.clone()),
-            VirtualRowRef::Raw { .. } => return Ok(()),
+            VirtualRowRef::Raw { .. } | VirtualRowRef::Pending { .. } => return Ok(()),
         };
 
         // Only allow expanding at the row's own depth level
@@ -1280,6 +1299,9 @@ impl GridState {
                             data.get_cell(arrow_col, *row_idx)
                         }
                     }
+                    VirtualRowRef::Pending { .. } => {
+                        GridCell::Loading { skeleton_width: None }
+                    }
                     VirtualRowRef::Raw { source_row, parent_key } => {
                         let mapping = raw_col_mappings_ref.get(display_col);
                         match mapping {
@@ -1344,7 +1366,7 @@ impl GridState {
         let vrow_icon_cols: Vec<Option<usize>> = self.virtual_rows.iter()
             .map(|vrow| match vrow {
                 VirtualRowRef::Aggregate { depth, .. } => group_key_display_cols_snap.get(*depth).copied(),
-                VirtualRowRef::Raw { .. } => None,
+                VirtualRowRef::Raw { .. } | VirtualRowRef::Pending { .. } => None,
             })
             .collect();
         let vrow_icon_cols_ref = vrow_icon_cols.clone();
@@ -1360,6 +1382,31 @@ impl GridState {
             vrow_icon_cols_ref.get(vrow_idx).and_then(|c| *c).map(|c| c == display_col).unwrap_or(false)
         };
         let group_key_display_cols_for_layout = self.group_key_display_cols.clone();
+
+        // For the header expand icons:
+        let gkdc_for_header = self.group_key_display_cols.clone();
+        let expanded_keys_for_header = self.expanded_keys.clone();
+        let grouped_data_rows = self.grouped_data.as_ref().map(|d| d.num_rows()).unwrap_or(0);
+        let expand_caches_keys: Vec<ExpandCacheKey> = self.expand_caches.keys().cloned().collect();
+
+        let is_group_key_col = move |display_col: usize| -> bool {
+            gkdc_for_header.contains(&display_col)
+        };
+        // A depth is "all expanded" if every top-level row has its cache key in expanded_keys.
+        // We approximate by checking if the number of expanded keys at depth `d` equals
+        // the number of top-level rows (for depth 0) or sub-rows (for depth 1+).
+        // Simpler: depth is all-expanded when expanded_keys is non-empty and covers all rows
+        // at that depth. For now we check: for depth 0, all grouped_data rows are expanded.
+        let is_depth_all_expanded = move |display_col: usize| -> bool {
+            // Find which depth this display_col corresponds to
+            // (it's the index in gkdc where gkdc[depth] == display_col, but gkdc was moved)
+            // We encode depth differently: depth 0 = first group key col.
+            // Count keys at depth 0 (single-entry cache keys).
+            let depth0_expanded = expanded_keys_for_header.iter()
+                .filter(|k| k.len() == 1)
+                .count();
+            grouped_data_rows > 0 && depth0_expanded >= grouped_data_rows
+        };
 
         crate::render::draw_grid(
             ctx,
@@ -1393,6 +1440,8 @@ impl GridState {
             &show_expand_icon_fn,
             &is_row_expanded,
             &is_aggregate_row,
+            &is_group_key_col,
+            &is_depth_all_expanded,
         );
 
 

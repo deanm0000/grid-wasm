@@ -45,6 +45,8 @@ pub fn draw_grid(
     show_expand_icon_fn: &dyn Fn(usize, usize) -> bool,
     is_row_expanded: &dyn Fn(usize) -> bool,
     is_aggregate_row: &dyn Fn(usize) -> bool,
+    is_group_key_col: &dyn Fn(usize) -> bool,
+    is_depth_all_expanded: &dyn Fn(usize) -> bool,
 ) {
     let total_header_height = header_height + group_header_height;
 
@@ -84,6 +86,8 @@ pub fn draw_grid(
         resolved_columns,
         col_drag,
         col_layout,
+        is_group_key_col,
+        is_depth_all_expanded,
     );
 
     draw_cells(

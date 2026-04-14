@@ -8,7 +8,7 @@ use crate::types::{
 };
 use crate::walk::{walk_columns, walk_rows_in_col, MappedColumn};
 
-use super::lib_utils::{cell_is_selected, draw_text_cell, get_middle_center_bias, rounded_rect};
+use super::lib_utils::{cell_is_selected, draw_text_cell, rounded_rect};
 
 /// Height of the skeleton loading placeholder bar in pixels.
 const SKELETON_HEIGHT: f64 = 8.0;
@@ -21,9 +21,9 @@ const FOCUS_RING_WIDTH: f64 = 2.0;
 /// 1 px left inset on cell background fill to leave room for the vertical grid line.
 const CELL_BACKGROUND_LEFT_INSET: f64 = 1.0;
 /// Width of the expand +/- icon box.
-const EXPAND_ICON_SIZE: f64 = 14.0;
+pub const EXPAND_ICON_SIZE: f64 = 14.0;
 /// Gap between expand icon and right cell edge.
-const EXPAND_ICON_PAD: f64 = 6.0;
+pub const EXPAND_ICON_PAD: f64 = 6.0;
 
 pub fn draw_cells(
     ctx: &mut CanvasCtx,
@@ -75,7 +75,7 @@ pub fn draw_cells(
             }
 
             let leaf = resolved.and_then(|r| r.leaf_by_display_index(c.source_index));
-            let data_style = leaf.and_then(|l| l.data_style.as_ref());
+            let leaf_data_style = leaf.and_then(|l| l.data_style.as_ref());
             let arrow_name = leaf.map(|l| l.arrow_name.as_str()).unwrap_or("");
 
             walk_rows_in_col(
@@ -97,6 +97,10 @@ pub fn draw_cells(
 
                     let is_agg = is_aggregate_row(row as usize);
                     let row_font = if is_agg { bold_font.as_str() } else { &font };
+
+                    // For raw rows, suppress the agg column's data_style so number formats
+                    // from grouped columns don't reformat raw source values.
+                    let data_style = if is_agg { leaf_data_style } else { None };
 
                     let show_expand_icon = is_agg && show_expand_icon_fn(c.source_index, row as usize);
 
@@ -184,7 +188,7 @@ pub fn draw_cells(
 }
 
 /// Draw the +/- expand icon at the right edge of a group-key cell.
-fn draw_expand_icon(
+pub fn draw_expand_icon(
     ctx: &mut CanvasCtx,
     cell_x: f64,
     cell_y: f64,
@@ -359,14 +363,12 @@ fn draw_accounting_cell(
     font: &str,
     color: &str,
 ) {
-    use super::lib_utils::get_middle_center_bias;
-
-    let bias = get_middle_center_bias(ctx, font);
-    let center_y = rect.y + rect.height / 2.0 + bias;
+    let center_y = rect.y + rect.height / 2.0;
     let pad = theme.cell_horizontal_padding;
 
     ctx.set_font(font);
     ctx.set_fill_style(color);
+    ctx.set_text_baseline("middle");
 
     let symbol_w = ctx.measure_text_width(symbol, font);
     let number_w = ctx.measure_text_width(number_str, font);
@@ -377,9 +379,9 @@ fn draw_accounting_cell(
         let _ = ctx.fill_text(symbol, rect.x + pad, center_y);
     }
 
-    // Number: right-aligned at right edge minus padding
     ctx.set_text_align("right");
     let _ = ctx.fill_text(number_str, rect.x + rect.width - pad, center_y);
+    ctx.set_text_baseline("alphabetic");
 }
 
 fn draw_loading_cell(

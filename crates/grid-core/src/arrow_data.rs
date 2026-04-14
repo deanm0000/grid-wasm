@@ -740,6 +740,122 @@ impl ArrowDataSource {
         Self::from_batches(batches, schema)
     }
 
+    /// Return a sub-datasource containing only rows where column `col_idx` has the
+    /// given display value. Pure in-memory scan — no DataFusion query needed.
+    pub fn rows_matching_column_value(&self, col_idx: usize, value: &str) -> Self {
+        let mut row_indices: Vec<usize> = Vec::new();
+        for row in 0..self.row_count {
+            if self.get_cell_raw_text(col_idx, row) == value {
+                row_indices.push(row);
+            }
+        }
+        let mut sub_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        let mut global_row = 0usize;
+        for batch in &self.batches {
+            let batch_len = batch.num_rows();
+            let mut mask = Vec::with_capacity(batch_len);
+            let mut idx_iter = row_indices.iter().peekable();
+            while idx_iter.peek().map(|&&i| i < global_row).unwrap_or(false) {
+                idx_iter.next();
+            }
+            for local_row in 0..batch_len {
+                let global = global_row + local_row;
+                if idx_iter.peek().copied() == Some(&global) {
+                    mask.push(true);
+                    idx_iter.next();
+                } else {
+                    mask.push(false);
+                }
+            }
+            global_row += batch_len;
+            let bool_arr = arrow_array::BooleanArray::from(mask);
+            if let Ok(filtered) = arrow::compute::filter_record_batch(batch, &bool_arr) {
+                if filtered.num_rows() > 0 {
+                    sub_batches.push(filtered);
+                }
+            }
+        }
+        if sub_batches.is_empty() {
+            return Self::from_batches(vec![], self.schema.clone()).unwrap_or_else(|_| Self {
+                batches: vec![], schema: self.schema.clone(), row_count: 0, column_count: 0, df_ctx: None,
+            });
+        }
+        let schema = sub_batches[0].schema();
+        Self::from_batches(sub_batches, schema).unwrap_or_else(|_| Self {
+            batches: vec![], schema: self.schema.clone(), row_count: 0, column_count: 0, df_ctx: None,
+        })
+    }
+
+    /// Partition this data source by the unique display values of column `col_idx`.
+    /// Returns a vec of `(display_value, sub_datasource)` pairs — one entry per unique value,
+    /// in the order they first appear.  Each sub-datasource contains only the rows for that value.
+    pub fn partition_by_column(&self, col_idx: usize) -> Vec<(String, Self)> {
+        let n = self.row_count;
+        if n == 0 || col_idx >= self.column_count {
+            return Vec::new();
+        }
+
+        // Walk rows once, collecting row indices grouped by their display value.
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+
+        for row in 0..n {
+            let val = self.get_cell_raw_text(col_idx, row);
+            let entry = groups.entry(val.clone());
+            if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+                order.push(val.clone());
+            }
+            entry.or_default().push(row);
+        }
+
+        // Build one sub-ArrowDataSource per group using Arrow's `filter` kernel.
+        let mut result: Vec<(String, Self)> = Vec::new();
+        for key_val in order {
+            let row_indices = match groups.get(&key_val) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Build a boolean mask for this group across all batches.
+            let mut sub_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+            let mut global_row = 0usize;
+            for batch in &self.batches {
+                let batch_len = batch.num_rows();
+                let mut mask = Vec::with_capacity(batch_len);
+                let mut idx_iter = row_indices.iter().peekable();
+                // Skip indices before this batch
+                while idx_iter.peek().map(|&&i| i < global_row).unwrap_or(false) {
+                    idx_iter.next();
+                }
+                for local_row in 0..batch_len {
+                    let global = global_row + local_row;
+                    if idx_iter.peek().copied() == Some(&global) {
+                        mask.push(true);
+                        idx_iter.next();
+                    } else {
+                        mask.push(false);
+                    }
+                }
+                global_row += batch_len;
+
+                let bool_arr = arrow_array::BooleanArray::from(mask);
+                if let Ok(filtered) = arrow::compute::filter_record_batch(batch, &bool_arr) {
+                    if filtered.num_rows() > 0 {
+                        sub_batches.push(filtered);
+                    }
+                }
+            }
+
+            if sub_batches.is_empty() { continue; }
+            let schema = sub_batches[0].schema();
+            if let Ok(sub_ds) = Self::from_batches(sub_batches, schema) {
+                result.push((key_val, sub_ds));
+            }
+        }
+
+        result
+    }
+
     /// Extract all non-null values in a date/datetime column as microseconds since epoch.
     /// Handles Date32 (days), Date64 (ms), Timestamp (various units).
     pub fn column_as_micros(&self, col: usize) -> Vec<i64> {

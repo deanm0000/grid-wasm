@@ -5,8 +5,9 @@ use crate::theme::Theme;
 use crate::types::{ColDragState, GridSelection, SortDirection, SortState};
 
 use crate::walk::{walk_columns, MappedColumn};
+use super::cells::{draw_expand_icon, EXPAND_ICON_PAD, EXPAND_ICON_SIZE};
 
-use super::lib_utils::get_middle_center_bias;
+
 
 /// Alpha (opacity) of the column header ghost while a column is being dragged.
 const COL_DRAG_GHOST_ALPHA: f64 = 0.35;
@@ -27,6 +28,8 @@ pub fn draw_grid_headers(
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
     col_layout: &ColumnLayout,
+    is_group_key_col: &dyn Fn(usize) -> bool,
+    is_depth_all_expanded: &dyn Fn(usize) -> bool,
 ) {
     let total_header_height = header_height + group_header_height;
     if total_header_height <= 0.0 {
@@ -37,9 +40,7 @@ pub fn draw_grid_headers(
     ctx.fill_rect(0.0, 0.0, width, total_header_height);
 
     let font = theme.header_font_full();
-    let base_font = theme.base_font_full();
     ctx.set_font(&font);
-    let bias = get_middle_center_bias(ctx, &base_font);
 
     if let Some(resolved) = resolved {
         if resolved.max_depth > 1 {
@@ -55,16 +56,18 @@ pub fn draw_grid_headers(
                 sort_state,
                 theme,
                 &font,
-                bias,
                 col_drag,
                 col_layout,
+                is_group_key_col,
+                is_depth_all_expanded,
             );
             return;
         }
     }
 
     draw_leaf_headers(
-        ctx, width, selection, sort_state, theme, &font, bias, resolved, col_drag, col_layout,
+        ctx, width, selection, sort_state, theme, &font, resolved, col_drag, col_layout,
+        is_group_key_col, is_depth_all_expanded,
     );
 }
 
@@ -80,9 +83,10 @@ fn draw_multi_level_headers(
     sort_state: &SortState,
     theme: &Theme,
     font: &str,
-    bias: f64,
     col_drag: Option<&ColDragState>,
     col_layout: &ColumnLayout,
+    is_group_key_col: &dyn Fn(usize) -> bool,
+    is_depth_all_expanded: &dyn Fn(usize) -> bool,
 ) {
     let total_header_height = header_height + group_header_height;
     let level_height = total_header_height / resolved.max_depth as f64;
@@ -128,9 +132,11 @@ fn draw_multi_level_headers(
             ctx.set_fill_style(text_color);
             ctx.set_font(text_font);
             ctx.set_text_align("left");
+            ctx.set_text_baseline("middle");
             let text_x = span_x + theme.cell_horizontal_padding;
-            let text_y = y + h / 2.0 + bias;
+            let text_y = y + h / 2.0;
             let _ = ctx.fill_text(&span.title, text_x, text_y);
+            ctx.set_text_baseline("alphabetic");
 
             ctx.restore();
 
@@ -175,10 +181,11 @@ fn draw_multi_level_headers(
         sort_state,
         theme,
         font,
-        bias,
         Some(resolved),
         col_drag,
         col_layout,
+        is_group_key_col,
+        is_depth_all_expanded,
     );
 }
 
@@ -189,13 +196,15 @@ fn draw_leaf_headers(
     sort_state: &SortState,
     theme: &Theme,
     font: &str,
-    bias: f64,
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
     col_layout: &ColumnLayout,
+    is_group_key_col: &dyn Fn(usize) -> bool,
+    is_depth_all_expanded: &dyn Fn(usize) -> bool,
 ) {
     draw_leaf_row_from_layout(
-        ctx, width, selection, sort_state, theme, font, bias, resolved, col_drag, col_layout,
+        ctx, width, selection, sort_state, theme, font, resolved, col_drag, col_layout,
+        is_group_key_col, is_depth_all_expanded,
     );
 }
 
@@ -206,10 +215,11 @@ fn draw_leaf_row_from_layout(
     sort_state: &SortState,
     theme: &Theme,
     font: &str,
-    bias: f64,
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
     col_layout: &ColumnLayout,
+    is_group_key_col: &dyn Fn(usize) -> bool,
+    is_depth_all_expanded: &dyn Fn(usize) -> bool,
 ) {
     let y = col_layout.leaf_y;
     let h = col_layout.leaf_h;
@@ -269,16 +279,20 @@ fn draw_leaf_row_from_layout(
         ctx.set_fill_style(text_color);
         ctx.set_font(text_font);
         ctx.set_text_align("left");
+        ctx.set_text_baseline("middle");
 
         let right_reserved = layout::header_right_reserved_width();
+        let is_gk = is_group_key_col(entry.source_index);
+        let extra_reserved = if is_gk { EXPAND_ICON_SIZE + EXPAND_ICON_PAD * 2.0 } else { 0.0 };
         let text_x = x + theme.cell_horizontal_padding;
-        let text_y = y + h / 2.0 + bias;
-        let text_max = w - theme.cell_horizontal_padding * 2.0 - right_reserved;
+        let text_y = y + h / 2.0;
+        let text_max = w - theme.cell_horizontal_padding * 2.0 - right_reserved - extra_reserved;
 
         let title = leaf.map(|l| l.display_name.as_str()).unwrap_or("");
         if text_max > 0.0 && !title.is_empty() {
             let _ = ctx.fill_text(title, text_x, text_y);
         }
+        ctx.set_text_baseline("alphabetic");
 
         let is_sort_active = sort_state.column == Some(entry.source_index);
 
@@ -325,6 +339,14 @@ fn draw_leaf_row_from_layout(
                 std::f64::consts::TAU,
             );
             ctx.fill();
+        }
+
+        // Draw expand/collapse-all icon just to the left of the right-reserved area.
+        if is_gk {
+            let all_expanded = is_depth_all_expanded(entry.source_index);
+            // Draw in a virtual cell whose right edge is at x + w - right_reserved.
+            let virtual_w = w - right_reserved;
+            draw_expand_icon(ctx, x, y, virtual_w, h, all_expanded, theme);
         }
 
         ctx.restore();

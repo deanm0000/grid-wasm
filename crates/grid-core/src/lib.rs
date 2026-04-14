@@ -16,8 +16,77 @@ use defaults::*;
 
 use canvas::CanvasCtx;
 use grid::GridState;
-use types::{AggregateFunction, ColDragState, ColSlideAnimation, ColumnInput, ResizeState, SortDirection, SortState};
+use types::{AggregateFunction, ColDragState, ColSlideAnimation, ColumnInput, DateTruncation, ResizeState, SortDirection, SortState};
 use wasm_bindgen::prelude::*;
+
+/// Each entry is (strftime_token, separator_that_follows_it_in_the_full_string).
+/// The chain is ordered coarsest → finest. The full format string is produced by
+/// concatenating token+separator for every entry (last entry has separator "").
+fn truncation_format_chain(t: DateTruncation) -> &'static [(&'static str, &'static str)] {
+    match t {
+        DateTruncation::Year       => &[("%Y", "")],
+        DateTruncation::Quarter    => &[("%Y", "-"), ("%m", "")],
+        DateTruncation::Month      => &[("%Y", "-"), ("%m", "")],
+        DateTruncation::Week       => &[("%Y", "-W"), ("%W", "")],
+        DateTruncation::Day        => &[("%Y", "-"), ("%m", "-"), ("%d", "")],
+        DateTruncation::Hour       => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", "")],
+        DateTruncation::Minute     => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", ":"), ("%M", "")],
+        DateTruncation::Second     => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", ":"), ("%M", ":"), ("%S", "")],
+        DateTruncation::Millisecond => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", ":"), ("%M", ":"), ("%S", "."), ("%3f", "")],
+        DateTruncation::Microsecond => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", ":"), ("%M", ":"), ("%S", "."), ("%6f", "")],
+        DateTruncation::Nanosecond  => &[("%Y", "-"), ("%m", "-"), ("%d", " "), ("%H", ":"), ("%M", ":"), ("%S", "."), ("%9f", "")],
+    }
+}
+
+/// The single strftime token that represents "this truncation level's own component"
+/// (i.e. the last / finest element in its chain).
+fn truncation_own_token(t: DateTruncation) -> &'static str {
+    truncation_format_chain(t).last().map(|(tok, _)| *tok).unwrap_or("")
+}
+
+/// Compute the default NumberFormat for a newly-added truncated group key.
+/// Looks at sibling keys for the same source column that already exist in group_keys,
+/// strips the components they cover from the front of the new key's format chain,
+/// and joins the remainder into a strftime format string.
+fn compute_default_truncation_format(
+    arrow_name: &str,
+    new_trunc: DateTruncation,
+    group_keys: &[types::DateGroupKey],
+) -> types::NumberFormat {
+    let chain = truncation_format_chain(new_trunc);
+
+    // Collect all tokens covered by existing sibling keys (same source, different truncation).
+    // A sibling covers every token in its own full chain, not just its finest token.
+    // e.g. a Month sibling covers both %Y and %m, so Day added alongside Month strips both.
+    let covered_tokens: std::collections::HashSet<&str> = group_keys.iter()
+        .filter(|k| k.arrow_name == arrow_name)
+        .filter_map(|k| k.truncation)
+        .filter(|&t| t != new_trunc)
+        .flat_map(|t| truncation_format_chain(t).iter().map(|(tok, _)| *tok))
+        .collect();
+
+    // Walk the chain from the start; strip any token that is already covered by a sibling.
+    // We remove from the front because the chain goes coarse→fine and siblings are coarser.
+    let remaining: Vec<(&str, &str)> = chain.iter()
+        .copied()
+        .filter(|(tok, _)| !covered_tokens.contains(tok))
+        .collect();
+
+    let format_str = if remaining.is_empty() {
+        chain.last().map(|(tok, _)| tok.to_string()).unwrap_or_default()
+    } else {
+        let mut s = String::new();
+        for (i, (tok, sep)) in remaining.iter().enumerate() {
+            s.push_str(tok);
+            if i < remaining.len() - 1 {
+                s.push_str(sep);
+            }
+        }
+        s
+    };
+
+    types::NumberFormat::DateTime { format: format_str }
+}
 use web_sys::HtmlCanvasElement;
 
 #[wasm_bindgen(start)]
@@ -853,16 +922,66 @@ impl DataGrid {
                     )));
                 }
             }
-            self.state.group_by_state.group_keys.push(key);
+            self.state.group_by_state.group_keys.push(key.clone());
             // Raw key: remove from aggregations (column is now a group key, not a value)
             // Truncated key: leave in aggregations (source column stays as value)
             if trunc.is_none() {
                 self.state.group_by_state.aggregations.retain(|(n, _)| n != arrow_name);
             }
+
+            // Auto-apply a default DateTime format for newly added truncated keys,
+            // stripping components already covered by sibling keys on the same source column.
+            if let Some(t) = trunc {
+                let fmt = compute_default_truncation_format(
+                    arrow_name,
+                    t,
+                    &self.state.group_by_state.group_keys,
+                );
+                self.state.format_overrides.insert(key.result_name(), Some(fmt));
+            }
         }
 
+        // Snapshot keys/aggs for auto-expand BEFORE enter_group_by (they won't change but
+        // borrow checker needs these to be independent of &mut self below).
+        let n_keys_after = self.state.group_by_state.group_keys.len();
+        let should_auto_expand = !is_key && n_keys_after > 1;
+        let auto_expand_group_keys = self.state.group_by_state.group_keys.clone();
+        let auto_expand_aggregations = self.state.group_by_state.aggregations.clone();
+
         self.state.enter_group_by(DEFAULT_COLUMN_WIDTH).await
-            .map_err(|e| JsValue::from_str(&e))
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        // Auto-expand: after adding a new group key, run one combined group_by over all keys,
+        // partition the result by the first key's value, and mark every top-level row expanded.
+        if should_auto_expand {
+            let first_key = &auto_expand_group_keys[0];
+            let first_result_name = first_key.result_name();
+
+            let combined = if let Some(ref data) = self.state.arrow_data {
+                data.group_by(&auto_expand_group_keys, &auto_expand_aggregations).await.ok()
+            } else {
+                None
+            };
+
+            if let Some(all_keys_data) = combined {
+                let col_idx = all_keys_data.schema().fields().iter()
+                    .position(|f| f.name().as_str() == first_result_name.as_str())
+                    .unwrap_or(0);
+
+                let partitions = all_keys_data.partition_by_column(col_idx);
+
+                for (key_display_val, sub_data) in partitions {
+                    let cache_key: types::ExpandCacheKey =
+                        vec![(first_result_name.clone(), key_display_val)];
+                    self.state.expand_caches.insert(cache_key.clone(), sub_data);
+                    self.state.expanded_keys.insert(cache_key);
+                }
+
+                self.state.rebuild_virtual_rows();
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove all group keys (any truncation) for the given source column.
@@ -902,7 +1021,7 @@ impl DataGrid {
         };
 
         self.state.group_by_state.set_agg_fns(arrow_name, final_fns);
-        self.state.run_group_by_query(DEFAULT_COLUMN_WIDTH).await
+        self.state.run_group_by_query_preserve_expand(DEFAULT_COLUMN_WIDTH).await
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -937,7 +1056,7 @@ impl DataGrid {
             .collect();
 
         self.state.group_by_state.set_agg_fns(arrow_name, updated);
-        self.state.run_group_by_query(DEFAULT_COLUMN_WIDTH).await
+        self.state.run_group_by_query_preserve_expand(DEFAULT_COLUMN_WIDTH).await
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -1639,6 +1758,29 @@ impl DataGrid {
             return "none".to_string();
         }
 
+        // Check header expand/collapse-all icon (group-key columns only, in leaf header row).
+        if !self.state.group_key_display_cols.is_empty() {
+            let leaf_y = self.state.col_layout.leaf_y;
+            let leaf_h = self.state.col_layout.leaf_h;
+            if y >= leaf_y && y <= leaf_y + leaf_h {
+                let icon_size = crate::render::cells::EXPAND_ICON_SIZE;
+                let icon_pad = crate::render::cells::EXPAND_ICON_PAD;
+                let right_reserved = layout::header_right_reserved_width();
+                for &gk_col in &self.state.group_key_display_cols {
+                    if let Some(entry) = self.state.col_layout.entry_by_source(gk_col) {
+                        // Icon is right-aligned within the virtual cell [entry.draw_x, entry.draw_x + entry.width - right_reserved]
+                        let virtual_right = entry.draw_x + entry.width - right_reserved;
+                        let icon_right = virtual_right - icon_pad;
+                        let icon_left = icon_right - icon_size;
+                        if x >= icon_left && x <= icon_right {
+                            self.state.pending_expand_row = Some(gk_col);
+                            return "header-expand-toggle".to_string();
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if mousedown is in the leaf header row (for column drag)
         let leaf_y = self.state.col_layout.leaf_y;
         let leaf_h = self.state.col_layout.leaf_h;
@@ -1724,6 +1866,143 @@ impl DataGrid {
 
     pub fn get_last_expand_row(&self) -> i32 {
         self.state.pending_expand_row.map(|r| r as i32).unwrap_or(-1)
+    }
+
+    /// Expand or collapse all rows for the group-key column at the given display index.
+    /// Expand-all is instant: marks all rows as expanded without fetching sub-data.
+    /// `fetch_visible_expand_rows` then fills in data lazily as rows scroll into view.
+    pub async fn toggle_header_expand(&mut self, display_col: usize) -> Result<(), JsValue> {
+        let group_key_display_cols = self.state.group_key_display_cols.clone();
+        let depth = match group_key_display_cols.iter().position(|&c| c == display_col) {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        if depth != 0 { return Ok(()); }
+
+        let n_top = self.state.grouped_data.as_ref().map(|d| d.num_rows()).unwrap_or(0);
+        let n_expanded_depth0 = self.state.expanded_keys.iter().filter(|k| k.len() == 1).count();
+        let all_expanded = n_top > 0 && n_expanded_depth0 >= n_top;
+
+        if all_expanded {
+            self.state.expanded_keys.clear();
+            self.state.expand_caches.clear();
+            self.state.lazy_combined_data = None;
+            self.state.rebuild_virtual_rows();
+            return Ok(());
+        }
+
+        // Expand all — lazily. For multi-key case, pre-compute the combined group_by once
+        // (one DataFusion query) and cache it for in-memory partitioning on demand.
+        let group_keys = self.state.group_by_state.group_keys.clone();
+        let aggregations = self.state.group_by_state.aggregations.clone();
+        let n_keys = group_keys.len();
+
+        if n_keys > 1 && self.state.lazy_combined_data.is_none() {
+            let combined = if let Some(ref data) = self.state.arrow_data {
+                data.group_by(&group_keys, &aggregations).await.ok()
+            } else { None };
+            self.state.lazy_combined_data = combined;
+        }
+
+        // Mark all top-level rows as expanded (no cache data yet → Pending rows).
+        let first_result_name = group_keys[0].result_name();
+        if let Some(grouped_data) = &self.state.grouped_data {
+            let col_idx = grouped_data.schema().fields().iter()
+                .position(|f| f.name().as_str() == first_result_name.as_str())
+                .unwrap_or(0);
+            let n = grouped_data.num_rows();
+            for row in 0..n {
+                let val = grouped_data.get_cell_raw_text(col_idx, row);
+                let ck: types::ExpandCacheKey = vec![(first_result_name.clone(), val)];
+                self.state.expanded_keys.insert(ck);
+                // Intentionally do NOT insert into expand_caches → will be Pending
+            }
+        }
+        self.state.rebuild_virtual_rows();
+        Ok(())
+    }
+
+    /// Fetch sub-level data for any Pending rows currently visible on screen.
+    /// Returns true if any data was fetched (caller should re-render).
+    pub async fn fetch_visible_expand_rows(&mut self) -> Result<bool, JsValue> {
+        if self.state.virtual_rows.is_empty() { return Ok(false); }
+
+        let total_header_height = self.state.header_height + self.state.group_header_height;
+        let data_height = (self.state.height - total_header_height).max(0.0);
+        let visible_count = if self.state.row_height > 0.0 {
+            (data_height / self.state.row_height).ceil() as usize + 2  // +2 buffer
+        } else {
+            30
+        };
+        let start = self.state.cell_y_offset;
+        let end = (start + visible_count).min(self.state.virtual_rows.len());
+
+        // Collect unique pending cache keys in the visible window.
+        let mut seen = std::collections::HashSet::new();
+        let pending_keys: Vec<types::ExpandCacheKey> = self.state.virtual_rows[start..end]
+            .iter()
+            .filter_map(|vrow| {
+                if let types::VirtualRowRef::Pending { cache_key, .. } = vrow {
+                    if seen.insert(cache_key.clone()) { Some(cache_key.clone()) } else { None }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if pending_keys.is_empty() { return Ok(false); }
+
+        let group_keys = self.state.group_by_state.group_keys.clone();
+        let aggregations = self.state.group_by_state.aggregations.clone();
+        let n_keys = group_keys.len();
+
+        for cache_key in &pending_keys {
+            if self.state.expand_caches.contains_key(cache_key) { continue; }
+
+            let is_leaf_level = cache_key.len() >= n_keys;
+
+            let result = if n_keys > 1 && !is_leaf_level {
+                // Use in-memory partition from lazy_combined_data (set during toggle_header_expand).
+                if let Some(ref combined) = self.state.lazy_combined_data {
+                    let first_result_name = group_keys[0].result_name();
+                    let col_idx = combined.schema().fields().iter()
+                        .position(|f| f.name().as_str() == first_result_name.as_str())
+                        .unwrap_or(0);
+                    let key_val = &cache_key[0].1;
+                    Some(combined.rows_matching_column_value(col_idx, key_val))
+                } else {
+                    // Fallback: run filter_raw + group_by for this single visible row.
+                    let filters: Vec<(types::DateGroupKey, String)> = cache_key.iter()
+                        .filter_map(|(col_name, v)| {
+                            group_keys.iter().find(|k| k.result_name() == *col_name)
+                                .map(|k| (k.clone(), v.clone()))
+                        }).collect();
+                    if let Some(ref data) = self.state.arrow_data {
+                        if let Ok(filtered) = data.filter_raw(&filters).await {
+                            filtered.group_by(&group_keys[1..], &aggregations).await.ok()
+                        } else { None }
+                    } else { None }
+                }
+            } else {
+                // Leaf level: filter_raw
+                let filters: Vec<(types::DateGroupKey, String)> = cache_key.iter()
+                    .filter_map(|(col_name, v)| {
+                        group_keys.iter().find(|k| k.result_name() == *col_name)
+                            .map(|k| (k.clone(), v.clone()))
+                    }).collect();
+                if let Some(ref data) = self.state.arrow_data {
+                    data.filter_raw(&filters).await.ok()
+                } else { None }
+            };
+
+            if let Some(data) = result {
+                self.state.expand_caches.insert(cache_key.clone(), data);
+            }
+        }
+
+        self.state.rebuild_virtual_rows();
+        Ok(true)
     }
 
     pub async fn toggle_row_expand(&mut self, virtual_row: usize) -> Result<(), JsValue> {

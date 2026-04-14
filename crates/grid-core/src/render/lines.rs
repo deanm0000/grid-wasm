@@ -3,7 +3,7 @@ use crate::theme::Theme;
 use crate::types::{ContentAlign, GridCell, GridSelection, Rectangle};
 use crate::walk::{walk_columns, walk_rows_in_col, MappedColumn};
 
-use super::lib_utils::{cell_is_selected, draw_text_cell, get_middle_center_bias, rounded_rect};
+use super::lib_utils::{cell_is_selected, draw_text_cell, rounded_rect};
 
 /// Draw grid lines (horizontal and vertical borders).
 pub fn draw_grid_lines(

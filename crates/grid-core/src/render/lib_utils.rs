@@ -2,8 +2,6 @@ use crate::canvas::CanvasCtx;
 use crate::theme::Theme;
 use crate::types::{ContentAlign, GridCell, GridSelection, Rectangle};
 
-/// Multiplier applied to font size to compute vertical text centering bias.
-const TEXT_VERTICAL_BIAS_FACTOR: f64 = 0.35;
 /// Fallback font size in pixels when the font string cannot be parsed.
 const FALLBACK_FONT_SIZE_PX: f64 = 13.0;
 /// Sub-pixel nudge for crisp left/right-aligned text rendering.
@@ -28,38 +26,8 @@ pub fn rounded_rect(ctx: &CanvasCtx, x: f64, y: f64, w: f64, h: f64, radius: f64
     ctx.close_path();
 }
 
-/// Measure the vertical offset needed to center text vertically in a cell.
-/// Returns a bias value to add to `y + h/2`.
-pub fn get_middle_center_bias(ctx: &mut CanvasCtx, font: &str) -> f64 {
-    let sample = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let m1 = ctx.measure_text(sample, font);
-
-    // Approximate: actualBoundingBoxAscent is not always available from web-sys
-    // We use a heuristic: bias ≈ -1 for typical 13px fonts
-    let width = m1.width();
-    if width > 0.0 {
-        // Rough approximation based on font metrics
-        // For a 13px font, typical ascent is ~10-11px
-        let font_size = parse_font_size(font);
-        -(font_size * TEXT_VERTICAL_BIAS_FACTOR)
-    } else {
-        0.0
-    }
-}
-
-fn parse_font_size(font: &str) -> f64 {
-    // font string is like "13px Inter, sans-serif" or "600 13px Inter"
-    for part in font.split_whitespace() {
-        if let Some(px) = part.strip_suffix("px") {
-            if let Ok(size) = px.parse::<f64>() {
-                return size;
-            }
-        }
-    }
-    FALLBACK_FONT_SIZE_PX // default
-}
-
 /// Draw a single line of text, aligned within a cell.
+/// Uses textBaseline="middle" so text is perfectly vertically centered at y + h/2.
 pub fn draw_single_text_line(
     ctx: &mut CanvasCtx,
     text: &str,
@@ -67,11 +35,11 @@ pub fn draw_single_text_line(
     y: f64,
     w: f64,
     h: f64,
-    bias: f64,
     theme: &Theme,
     align: Option<ContentAlign>,
 ) {
-    let center_y = y + h / 2.0 + bias;
+    let center_y = y + h / 2.0;
+    ctx.set_text_baseline("middle");
 
     match align {
         Some(ContentAlign::Right) => {
@@ -87,6 +55,8 @@ pub fn draw_single_text_line(
             let _ = ctx.fill_text(text, x + theme.cell_horizontal_padding + TEXT_SUBPIXEL_NUDGE, center_y);
         }
     }
+
+    ctx.set_text_baseline("alphabetic");
 }
 
 /// Truncate a string so it fits within the given width.
@@ -117,7 +87,6 @@ pub fn draw_text_cell(
     }
 
     let truncated = truncate_string(ctx, data, rect.width, font);
-    let bias = get_middle_center_bias(ctx, font);
 
     // Detect RTL (simple heuristic)
     let is_rtl = is_rtl_text(&truncated);
@@ -139,7 +108,7 @@ pub fn draw_text_cell(
         ctx.set_text_align("left");
     }
 
-    draw_single_text_line(ctx, &truncated, rect.x, rect.y, rect.width, rect.height, bias, theme, align);
+    draw_single_text_line(ctx, &truncated, rect.x, rect.y, rect.width, rect.height, theme, align);
 
     // Reset
     if is_rtl {

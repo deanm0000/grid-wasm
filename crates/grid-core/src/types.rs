@@ -94,6 +94,9 @@ pub enum VirtualRowRef {
     },
     /// A raw source-data row (leaf level, no further expansion possible).
     Raw { source_row: usize, parent_key: ExpandCacheKey },
+    /// Placeholder for an expanded row whose sub-data has not been fetched yet.
+    /// Rendered as a loading skeleton. Replaced by real rows once data is fetched.
+    Pending { cache_key: ExpandCacheKey, depth: usize },
 }
 
 impl VirtualRowRef {
@@ -104,6 +107,7 @@ impl VirtualRowRef {
         match self {
             VirtualRowRef::Aggregate { depth, .. } => *depth,
             VirtualRowRef::Raw { .. } => usize::MAX,
+            VirtualRowRef::Pending { .. } => usize::MAX,
         }
     }
 }
