@@ -110,6 +110,9 @@ pub fn normalize_columns(
                         header_style: None,
                         data_style: None,
                         children: None,
+                        agg_func: None,
+                        group_by: None,
+                        group_by_truncation: None,
                     }
                 }
             })
@@ -127,6 +130,9 @@ pub fn normalize_columns(
             header_style: None,
             data_style: None,
             children: None,
+        agg_func: None,
+        group_by: None,
+        group_by_truncation: None,
         })
         .collect())
 }

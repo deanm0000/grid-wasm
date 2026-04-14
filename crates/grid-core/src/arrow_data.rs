@@ -4,9 +4,84 @@ use arrow_schema::{DataType, Field, Schema};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::types::{ContentAlign, GridCell, GridColumn};
+use crate::types::{ContentAlign, DateTruncation, GridCell, GridColumn};
 
 pub const ROW_ID_COL: &str = "__row_id__";
+
+/// Safely read a Timestamp array value as microseconds since epoch,
+/// handling all four Arrow TimeUnit variants without panicking.
+fn timestamp_to_micros(array: &std::sync::Arc<dyn arrow_array::Array>, row: usize, unit: &arrow_schema::TimeUnit) -> i64 {
+    use arrow_array::cast::as_primitive_array;
+    use arrow_array::types::*;
+    use arrow_schema::TimeUnit;
+    match unit {
+        TimeUnit::Second      => as_primitive_array::<TimestampSecondType>(array).value(row) * 1_000_000,
+        TimeUnit::Millisecond => as_primitive_array::<TimestampMillisecondType>(array).value(row) * 1_000,
+        TimeUnit::Microsecond => as_primitive_array::<TimestampMicrosecondType>(array).value(row),
+        TimeUnit::Nanosecond  => as_primitive_array::<TimestampNanosecondType>(array).value(row) / 1_000,
+    }
+}
+
+/// Truncate a microsecond timestamp to the floor of the given granularity.
+fn truncate_micros(val: i64, t: crate::types::DateTruncation) -> i64 {
+    use crate::types::DateTruncation;
+    const SEC:  i64 = 1_000_000;
+    const MIN:  i64 = 60 * SEC;
+    const HOUR: i64 = 3600 * SEC;
+    const DAY:  i64 = 86_400 * SEC;
+    const WEEK: i64 = 7 * DAY;
+    match t {
+        DateTruncation::Nanosecond | DateTruncation::Microsecond => val,
+        DateTruncation::Millisecond => (val / 1_000) * 1_000,
+        DateTruncation::Second  => (val / SEC) * SEC,
+        DateTruncation::Minute  => (val / MIN) * MIN,
+        DateTruncation::Hour    => (val / HOUR) * HOUR,
+        DateTruncation::Day     => (val / DAY) * DAY,
+        DateTruncation::Week    => {
+            let offset = 3 * DAY; // epoch (1970-01-01) is Thursday; offset aligns to Monday
+            ((val - offset) / WEEK) * WEEK + offset
+        }
+        DateTruncation::Month => {
+            use chrono::{DateTime, Datelike, TimeZone, Utc};
+            match DateTime::from_timestamp(val / SEC, 0) {
+                Some(dt) => Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+                    .unwrap().timestamp() * SEC,
+                None => val,
+            }
+        }
+        DateTruncation::Quarter => {
+            use chrono::{DateTime, Datelike, TimeZone, Utc};
+            match DateTime::from_timestamp(val / SEC, 0) {
+                Some(dt) => {
+                    let q = ((dt.month() - 1) / 3) * 3 + 1;
+                    Utc.with_ymd_and_hms(dt.year(), q, 1, 0, 0, 0).unwrap().timestamp() * SEC
+                }
+                None => val,
+            }
+        }
+        DateTruncation::Year => {
+            use chrono::{DateTime, Datelike, TimeZone, Utc};
+            match DateTime::from_timestamp(val / SEC, 0) {
+                Some(dt) => Utc.with_ymd_and_hms(dt.year(), 1, 1, 0, 0, 0)
+                    .unwrap().timestamp() * SEC,
+                None => val,
+            }
+        }
+    }
+}
+
+/// Values above this threshold are displayed in scientific notation.
+const SCI_NOTATION_UPPER_THRESHOLD: f64 = 1e9;
+/// Values below this threshold (and above zero) are displayed in scientific notation.
+const SCI_NOTATION_LOWER_THRESHOLD: f64 = 0.001;
+/// Number of decimal places used when displaying floats in fixed or scientific notation.
+const FLOAT_DISPLAY_PRECISION: usize = 6;
+/// Column width multiplier for numeric columns relative to the default width.
+const NUMERIC_COL_WIDTH_RATIO: f64 = 0.8;
+/// Column width multiplier for boolean columns relative to the default width.
+const BOOLEAN_COL_WIDTH_RATIO: f64 = 0.5;
+/// Microseconds per second, used for timestamp unit conversion.
+const MICROS_PER_SECOND: i64 = 1_000_000;
 
 fn make_row_id_schema(user_schema: &Schema) -> Arc<Schema> {
     let mut fields: Vec<Field> = user_schema.fields().iter().map(|f| (**f).clone()).collect();
@@ -394,12 +469,528 @@ impl ArrowDataSource {
         Err("SQL support not compiled in. Enable the 'datafusion-sql' feature.".to_string())
     }
 
+    /// Perform a GROUP BY + aggregate query using DataFusion's DataFrame API.
+    /// Returns a new ArrowDataSource with the aggregated result.
+    pub async fn group_by(
+        &self,
+        group_keys: &[crate::types::DateGroupKey],
+        aggregations: &[(String, Vec<crate::types::AggregateFunction>)],
+    ) -> Result<Self, String> {
+        use crate::types::AggregateFunction;
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
+        use datafusion::prelude::*;
+
+        if group_keys.is_empty() {
+            return Err("No group keys specified".to_string());
+        }
+
+        let user_schema = self.schema.clone();
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(
+            make_row_id_schema(&user_schema),
+            vec![self.batches.clone()],
+        )
+        .map_err(|e| format!("Failed to create MemTable: {}", e))?;
+
+        ctx.register_table("data", Arc::new(table))
+            .map_err(|e| format!("Failed to register table: {}", e))?;
+
+        let df = ctx.table("data").await
+            .map_err(|e| format!("Failed to read table: {}", e))?;
+
+        // Build group expressions — date columns use date_trunc(), others use col()
+        let group_exprs: Vec<Expr> = group_keys.iter().map(|key| {
+            match key.truncation {
+                None => col(key.arrow_name.as_str()),
+                Some(t) => {
+                    use datafusion::functions::datetime::expr_fn::date_trunc;
+                    date_trunc(lit(t.precision()), col(key.arrow_name.as_str()))
+                        .alias(key.result_name())
+                }
+            }
+        }).collect();
+
+        let mut agg_exprs: Vec<Expr> = Vec::new();
+        for (col_name, agg_fns) in aggregations {
+            for agg_fn in agg_fns {
+                let alias = agg_fn.alias(col_name);
+                let expr = match agg_fn {
+                    AggregateFunction::Count => count(lit(1u8)).alias(alias),
+                    AggregateFunction::Sum => sum(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Min => min(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Max => max(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Mean => avg(col(col_name.as_str())).alias(alias),
+                };
+                agg_exprs.push(expr);
+            }
+        }
+
+        if agg_exprs.is_empty() {
+            return Err("No aggregations specified".to_string());
+        }
+
+        let grouped = df.aggregate(group_exprs, agg_exprs)
+            .map_err(|e| format!("Aggregate failed: {}", e))?;
+
+        let batches = grouped.collect().await
+            .map_err(|e| format!("Failed to collect grouped result: {}", e))?;
+
+        if batches.is_empty() {
+            return Err("Group by returned no results".to_string());
+        }
+
+        let result_schema = batches[0].schema();
+        Self::from_batches(batches, result_schema)
+    }
+
+    /// A filter predicate for a single group key column.
+    /// `result_col` is the aliased result name (e.g. "created_at_month").
+    /// `key` is the DateGroupKey that produced it (used to reconstruct the date_trunc expr).
+    /// `display_value` is the string from the aggregate row — parsed back to a timestamp to build
+    /// an equality filter on the original source column.
+    pub(crate) fn build_filter_expr(
+        key: &crate::types::DateGroupKey,
+        display_value: &str,
+        source_schema: &arrow_schema::Schema,
+    ) -> Option<datafusion::prelude::Expr> {
+        use datafusion::prelude::*;
+        use datafusion::functions::datetime::expr_fn::date_trunc;
+        use datafusion::scalar::ScalarValue;
+        use arrow_schema::DataType;
+
+        let source_dtype = source_schema.field_with_name(&key.arrow_name)
+            .map(|f| f.data_type().clone())
+            .unwrap_or(DataType::Utf8);
+
+        if key.truncation.is_some() {
+            let ts_micros = Self::parse_display_as_ts_micros(display_value)?;
+            let ts_nanos = ts_micros.checked_mul(1_000)?;
+            let ts_lit = lit(ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
+            let lhs = date_trunc(lit(key.truncation.unwrap().precision()), col(key.arrow_name.as_str()));
+            Some(lhs.eq(ts_lit))
+        } else {
+            // No truncation: direct equality using the column's actual type.
+            let rhs = match &source_dtype {
+                DataType::Boolean => {
+                    lit(display_value.eq_ignore_ascii_case("true"))
+                }
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    let v = display_value.parse::<i64>().ok()?;
+                    lit(v)
+                }
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                    let v = display_value.parse::<u64>().ok()?;
+                    lit(v)
+                }
+                DataType::Float32 | DataType::Float64 => {
+                    let v = display_value.parse::<f64>().ok()?;
+                    lit(v)
+                }
+                DataType::Timestamp(_, _) => {
+                    let ts_micros = Self::parse_display_as_ts_micros(display_value)?;
+                    let utc: Arc<str> = Arc::from("UTC");
+                    lit(ScalarValue::TimestampMicrosecond(Some(ts_micros), Some(utc)))
+                }
+                _ => lit(display_value),
+            };
+            Some(col(key.arrow_name.as_str()).eq(rhs))
+        }
+    }
+
+    fn parse_display_as_ts_micros(display_value: &str) -> Option<i64> {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(display_value) {
+            return Some(dt.timestamp_micros());
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(display_value, "%Y-%m-%d %H:%M:%S") {
+            return Some(dt.and_utc().timestamp_micros());
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(display_value, "%Y-%m-%d") {
+            return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
+        }
+        None
+    }
+
+    /// Filter source data to rows matching the given group key values, then run a sub-level
+    /// GROUP BY + aggregate. Returns the sub-level aggregated ArrowDataSource sorted by
+    /// the first group key ascending.
+    pub async fn filter_and_group(
+        &self,
+        filters: &[(crate::types::DateGroupKey, String)],
+        group_keys: &[crate::types::DateGroupKey],
+        aggregations: &[(String, Vec<crate::types::AggregateFunction>)],
+    ) -> Result<Self, String> {
+        use crate::types::AggregateFunction;
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
+        use datafusion::prelude::*;
+
+        let user_schema = self.schema.clone();
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(
+            make_row_id_schema(&user_schema),
+            vec![self.batches.clone()],
+        ).map_err(|e| format!("MemTable error: {}", e))?;
+        ctx.register_table("data", Arc::new(table))
+            .map_err(|e| format!("Register error: {}", e))?;
+
+        let mut df = ctx.table("data").await
+            .map_err(|e| format!("Table error: {}", e))?;
+
+        for (key, value) in filters {
+            if let Some(pred) = Self::build_filter_expr(key, value, &user_schema) {
+                df = df.filter(pred).map_err(|e| format!("Filter error: {}", e))?;
+            }
+        }
+
+        let group_exprs: Vec<Expr> = group_keys.iter().map(|key| {
+            match key.truncation {
+                None => col(key.arrow_name.as_str()),
+                Some(t) => {
+                    use datafusion::functions::datetime::expr_fn::date_trunc;
+                    date_trunc(lit(t.precision()), col(key.arrow_name.as_str()))
+                        .alias(key.result_name())
+                }
+            }
+        }).collect();
+
+        let mut agg_exprs: Vec<Expr> = Vec::new();
+        for (col_name, agg_fns) in aggregations {
+            for agg_fn in agg_fns {
+                let alias = agg_fn.alias(col_name);
+                let expr = match agg_fn {
+                    AggregateFunction::Count => count(lit(1u8)).alias(alias),
+                    AggregateFunction::Sum => sum(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Min => min(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Max => max(col(col_name.as_str())).alias(alias),
+                    AggregateFunction::Mean => avg(col(col_name.as_str())).alias(alias),
+                };
+                agg_exprs.push(expr);
+            }
+        }
+
+        let grouped = df.aggregate(group_exprs.clone(), agg_exprs)
+            .map_err(|e| format!("Aggregate error: {}", e))?;
+
+        let sorted = if let Some(first) = group_exprs.first() {
+            grouped.sort(vec![first.clone().sort(true, true)])
+                .map_err(|e| format!("Sort error: {}", e))?
+        } else {
+            grouped
+        };
+
+        let batches = sorted.collect().await
+            .map_err(|e| format!("Collect error: {}", e))?;
+        if batches.is_empty() {
+            return Err("No results".to_string());
+        }
+        let schema = batches[0].schema();
+        Self::from_batches(batches, schema)
+    }
+
+    /// Filter source data to raw rows matching the given group key values.
+    /// Returns the matching rows sorted by the first group key ascending.
+    pub async fn filter_raw(
+        &self,
+        filters: &[(crate::types::DateGroupKey, String)],
+    ) -> Result<Self, String> {
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use datafusion::prelude::*;
+
+        let user_schema = self.schema.clone();
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(
+            make_row_id_schema(&user_schema),
+            vec![self.batches.clone()],
+        ).map_err(|e| format!("MemTable error: {}", e))?;
+        ctx.register_table("data", Arc::new(table))
+            .map_err(|e| format!("Register error: {}", e))?;
+
+        let mut df = ctx.table("data").await
+            .map_err(|e| format!("Table error: {}", e))?;
+
+        for (key, value) in filters {
+            if let Some(pred) = Self::build_filter_expr(key, value, &user_schema) {
+                df = df.filter(pred).map_err(|e| format!("Filter error: {}", e))?;
+            }
+        }
+
+        if !filters.is_empty() {
+            let first_key = &filters[0].0;
+            let sort_expr = match first_key.truncation {
+                None => col(first_key.arrow_name.as_str()).sort(true, true),
+                Some(t) => {
+                    use datafusion::functions::datetime::expr_fn::date_trunc;
+                    date_trunc(lit(t.precision()), col(first_key.arrow_name.as_str()))
+                        .sort(true, true)
+                }
+            };
+            df = df.sort(vec![sort_expr]).map_err(|e| format!("Sort error: {}", e))?;
+        }
+
+        let batches = df.collect().await
+            .map_err(|e| format!("Collect error: {}", e))?;
+        if batches.is_empty() {
+            return Self::from_batches(vec![], user_schema);
+        }
+        let schema = batches[0].schema();
+        Self::from_batches(batches, schema)
+    }
+
+    /// Extract all non-null values in a date/datetime column as microseconds since epoch.
+    /// Handles Date32 (days), Date64 (ms), Timestamp (various units).
+    pub fn column_as_micros(&self, col: usize) -> Vec<i64> {
+        use arrow_array::cast::as_primitive_array;
+        use arrow_array::types::*;
+        use arrow_schema::DataType;
+
+        if col >= self.column_count { return Vec::new(); }
+        let dtype = self.schema.field(col).data_type().clone();
+        let mut result = Vec::new();
+
+        macro_rules! collect_as_micros {
+            ($ty:ty, $factor:expr) => {{
+                for batch in &self.batches {
+                    if col >= batch.num_columns() { continue; }
+                    let arr = as_primitive_array::<$ty>(batch.column(col));
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            result.push(arr.value(i) as i64 * $factor);
+                        }
+                    }
+                }
+            }};
+        }
+
+        match dtype {
+            DataType::Date32 => collect_as_micros!(Date32Type, 86_400_000_000),
+            DataType::Date64 => collect_as_micros!(Date64Type, 1_000),
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, _) =>
+                collect_as_micros!(TimestampSecondType, 1_000_000),
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) =>
+                collect_as_micros!(TimestampMillisecondType, 1_000),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) =>
+                collect_as_micros!(TimestampMicrosecondType, 1),
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+                for batch in &self.batches {
+                    if col >= batch.num_columns() { continue; }
+                    let arr = as_primitive_array::<TimestampNanosecondType>(batch.column(col));
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            result.push(arr.value(i) / 1_000);
+                        }
+                    }
+                }
+            }
+            // String columns storing ISO 8601 datetimes (e.g. "2022-01-01T00:00:00Z")
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                use chrono::DateTime;
+                for batch in &self.batches {
+                    if col >= batch.num_columns() { continue; }
+                    let arr = if matches!(dtype, DataType::LargeUtf8) {
+                        use arrow_array::cast::as_largestring_array;
+                        as_largestring_array(batch.column(col)).iter()
+                            .filter_map(|v| v)
+                            .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .for_each(|dt| result.push(dt.timestamp_micros()));
+                        continue;
+                    } else {
+                        use arrow_array::cast::as_string_array;
+                        as_string_array(batch.column(col)).iter()
+                            .filter_map(|v| v)
+                            .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .for_each(|dt| result.push(dt.timestamp_micros()));
+                        continue;
+                    };
+                    let _ = arr;
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
+    /// Infer useful date truncation levels for a column.
+    /// Returns (available_truncations, is_estimate).
+    /// is_estimate = true means we assumed sorted order for the smallest-tick calculation.
+    pub fn infer_date_truncations(&self, col: usize) -> (Vec<crate::types::DateTruncation>, bool) {
+        use crate::types::DateTruncation;
+
+        let values = self.column_as_micros(col);
+        if values.is_empty() {
+            return (DateTruncation::all_coarsest_first().to_vec(), true);
+        }
+
+        let min_val = values[0];
+        let max_val = *values.last().unwrap();
+
+        // HIGH-END: exclude truncations where trunc(first) == trunc(last)
+        // — the whole dataset falls within a single bucket of that granularity.
+        let dont_offer_coarse: Vec<DateTruncation> = DateTruncation::all_coarsest_first()
+            .iter()
+            .filter(|&&t| truncate_micros(min_val, t) == truncate_micros(max_val, t))
+            .copied()
+            .collect();
+
+        // LOW-END: smallest non-zero diff between consecutive values (assumes sorted).
+        let smallest_tick: Option<i64> = values.windows(2)
+            .filter_map(|w| {
+                let d = (w[1] - w[0]).abs();
+                if d > 0 { Some(d) } else { None }
+            })
+            .min();
+
+        let dont_offer_fine: Vec<DateTruncation> = if let Some(tick) = smallest_tick {
+            DateTruncation::all_coarsest_first()
+                .iter()
+                .filter(|&&t| t.duration_micros() <= tick)
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let available: Vec<DateTruncation> = DateTruncation::all_coarsest_first()
+            .iter()
+            .filter(|t| !dont_offer_coarse.contains(t) && !dont_offer_fine.contains(t))
+            .copied()
+            .collect();
+
+        (available, true) // always an estimate (assumes sorted)
+    }
+
     pub fn num_rows(&self) -> usize {
         self.row_count
     }
 
     pub fn num_columns(&self) -> usize {
         self.column_count
+    }
+
+    /// Compute min and max for a numeric column by index (user column, not __row_id__).
+    pub fn column_min_max(&self, col: usize) -> Option<(f64, f64)> {
+        use arrow_array::cast::as_primitive_array;
+        use arrow_array::types::*;
+        use arrow_schema::DataType;
+
+        if col >= self.column_count { return None; }
+        let dtype = self.schema.field(col).data_type().clone();
+
+        let mut global_min = f64::INFINITY;
+        let mut global_max = f64::NEG_INFINITY;
+
+        macro_rules! scan_numeric {
+            ($ty:ty) => {{
+                for batch in &self.batches {
+                    if col >= batch.num_columns() { continue; }
+                    let arr = as_primitive_array::<$ty>(batch.column(col));
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            let v = arr.value(i) as f64;
+                            if v < global_min { global_min = v; }
+                            if v > global_max { global_max = v; }
+                        }
+                    }
+                }
+            }};
+        }
+
+        match dtype {
+            DataType::Int8   => scan_numeric!(Int8Type),
+            DataType::Int16  => scan_numeric!(Int16Type),
+            DataType::Int32  => scan_numeric!(Int32Type),
+            DataType::Int64  => scan_numeric!(Int64Type),
+            DataType::UInt8  => scan_numeric!(UInt8Type),
+            DataType::UInt16 => scan_numeric!(UInt16Type),
+            DataType::UInt32 => scan_numeric!(UInt32Type),
+            DataType::UInt64 => scan_numeric!(UInt64Type),
+            DataType::Float32 => scan_numeric!(Float32Type),
+            DataType::Float64 => scan_numeric!(Float64Type),
+            _ => return None,
+        }
+
+        if global_min.is_infinite() { None } else { Some((global_min, global_max)) }
+    }
+
+    /// Compute approximate percentile bounds for a numeric column.
+    /// Returns (p_low, p_high) where p_low is the `low_pct` percentile value
+    /// and p_high is the `high_pct` percentile value (e.g. 0.05 and 0.95).
+    pub fn column_percentiles(&self, col: usize, low_pct: f64, high_pct: f64) -> Option<(f64, f64)> {
+        use arrow_array::cast::as_primitive_array;
+        use arrow_array::types::*;
+        use arrow_schema::DataType;
+
+        if col >= self.column_count { return None; }
+        let dtype = self.schema.field(col).data_type().clone();
+
+        let mut values: Vec<f64> = Vec::new();
+
+        macro_rules! collect_numeric {
+            ($ty:ty) => {{
+                for batch in &self.batches {
+                    if col < batch.num_columns() {
+                        let arr = as_primitive_array::<$ty>(batch.column(col));
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                values.push(arr.value(i) as f64);
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+
+        match dtype {
+            DataType::Int8   => collect_numeric!(Int8Type),
+            DataType::Int16  => collect_numeric!(Int16Type),
+            DataType::Int32  => collect_numeric!(Int32Type),
+            DataType::Int64  => collect_numeric!(Int64Type),
+            DataType::UInt8  => collect_numeric!(UInt8Type),
+            DataType::UInt16 => collect_numeric!(UInt16Type),
+            DataType::UInt32 => collect_numeric!(UInt32Type),
+            DataType::UInt64 => collect_numeric!(UInt64Type),
+            DataType::Float32 => collect_numeric!(Float32Type),
+            DataType::Float64 => collect_numeric!(Float64Type),
+            _ => return None,
+        }
+
+        if values.is_empty() { return None; }
+
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = values.len();
+        let low_idx  = ((n as f64 * low_pct).floor() as usize).min(n - 1);
+        let high_idx = ((n as f64 * high_pct).ceil() as usize).min(n - 1);
+        Some((values[low_idx], values[high_idx]))
+    }
+
+    /// Get unique sorted string values for a column (for value picker UI).
+    /// Returns up to `limit` values; is_truncated = true if more exist.
+    pub fn column_unique_values(&self, col: usize, limit: usize) -> (Vec<String>, bool) {
+        use std::collections::BTreeSet;
+
+        let mut seen = BTreeSet::new();
+        let mut truncated = false;
+
+        for batch in &self.batches {
+            if col >= batch.num_columns() { continue; }
+            let array = batch.column(col);
+            for row in 0..array.len() {
+                if array.is_null(row) { continue; }
+                let s = format_cell_display(array, row, self.schema.field(col).data_type());
+                if seen.len() < limit {
+                    seen.insert(s);
+                } else {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated { break; }
+        }
+
+        (seen.into_iter().collect(), truncated)
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
@@ -507,8 +1098,8 @@ impl ArrowDataSource {
                     | DataType::UInt64
                     | DataType::Float16
                     | DataType::Float32
-                    | DataType::Float64 => ("number".to_string(), 0.8),
-                    DataType::Boolean => ("boolean".to_string(), 0.5),
+                    | DataType::Float64 => ("number".to_string(), NUMERIC_COL_WIDTH_RATIO),
+                    DataType::Boolean => ("boolean".to_string(), BOOLEAN_COL_WIDTH_RATIO),
                     DataType::Utf8 | DataType::LargeUtf8 => ("string".to_string(), 1.0),
                     _ => ("string".to_string(), 1.0),
                 };
@@ -522,6 +1113,64 @@ impl ArrowDataSource {
                 }
             })
             .collect()
+    }
+
+    /// Get a cell's raw value as a plain string for clipboard export.
+    /// Numbers returned as raw floats, dates as ISO strings, strings as-is.
+    pub fn get_cell_raw_text(&self, col: usize, row: usize) -> String {
+        use arrow_array::cast::*;
+        use arrow_array::types::*;
+
+        if col >= self.column_count || row >= self.row_count {
+            return String::new();
+        }
+        let (batch, local_row) = self.find_batch_row(row);
+        if col >= batch.num_columns() {
+            return String::new();
+        }
+        let array = batch.column(col);
+        if array.is_null(local_row) {
+            return String::new();
+        }
+        let field = self.schema.field(col);
+        match field.data_type() {
+            DataType::Int8 => as_primitive_array::<Int8Type>(array).value(local_row).to_string(),
+            DataType::Int16 => as_primitive_array::<Int16Type>(array).value(local_row).to_string(),
+            DataType::Int32 => as_primitive_array::<Int32Type>(array).value(local_row).to_string(),
+            DataType::Int64 => as_primitive_array::<Int64Type>(array).value(local_row).to_string(),
+            DataType::UInt8 => as_primitive_array::<UInt8Type>(array).value(local_row).to_string(),
+            DataType::UInt16 => as_primitive_array::<UInt16Type>(array).value(local_row).to_string(),
+            DataType::UInt32 => as_primitive_array::<UInt32Type>(array).value(local_row).to_string(),
+            DataType::UInt64 => as_primitive_array::<UInt64Type>(array).value(local_row).to_string(),
+            DataType::Float32 => as_primitive_array::<Float32Type>(array).value(local_row).to_string(),
+            DataType::Float64 => as_primitive_array::<Float64Type>(array).value(local_row).to_string(),
+            DataType::Boolean => as_boolean_array(array).value(local_row).to_string(),
+            DataType::Utf8 => as_string_array(array).value(local_row).to_string(),
+            DataType::LargeUtf8 => as_largestring_array(array).value(local_row).to_string(),
+            DataType::Date32 => {
+                use arrow::temporal_conversions::date32_to_datetime;
+                let val = as_primitive_array::<Date32Type>(array).value(local_row);
+                date32_to_datetime(val)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| val.to_string())
+            }
+            DataType::Date64 => {
+                use arrow::temporal_conversions::date64_to_datetime;
+                let val = as_primitive_array::<Date64Type>(array).value(local_row);
+                date64_to_datetime(val)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| val.to_string())
+            }
+            DataType::Timestamp(unit, _) => {
+                let micros = timestamp_to_micros(array, local_row, unit);
+                let secs = micros / MICROS_PER_SECOND;
+                let nsecs = ((micros % MICROS_PER_SECOND) * 1000).unsigned_abs() as u32;
+                chrono::DateTime::from_timestamp(secs, nsecs)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| micros.to_string())
+            }
+            _ => format!("{:?}", array.slice(local_row, 1)),
+        }
     }
 
     /// Get a cell value as a GridCell.
@@ -790,12 +1439,16 @@ fn format_cell(array: &Arc<dyn Array>, row: usize, dtype: &DataType) -> GridCell
                 content_align: None,
             }
         }
-        DataType::Timestamp(_, _) => {
-            use arrow_array::types::*;
-            let val = as_primitive_array::<TimestampMicrosecondType>(array).value(row);
-            GridCell::Text {
-                data: val.to_string(),
-                display_data: None,
+        DataType::Timestamp(unit, _) => {
+            let micros = timestamp_to_micros(array, row, unit);
+            let secs = micros / MICROS_PER_SECOND;
+            let nsecs = ((micros % MICROS_PER_SECOND) * 1000).unsigned_abs() as u32;
+            let display = chrono::DateTime::from_timestamp(secs, nsecs)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| micros.to_string());
+            GridCell::Number {
+                data: Some(micros as f64),
+                display_data: Some(display),
                 content_align: None,
             }
         }
@@ -870,10 +1523,10 @@ fn format_float(val: f64) -> String {
         }
     } else {
         let abs = val.abs();
-        if abs >= 1e9 || (abs < 0.001 && abs > 0.0) {
-            format!("{:.6e}", val)
+        if abs >= SCI_NOTATION_UPPER_THRESHOLD || (abs < SCI_NOTATION_LOWER_THRESHOLD && abs > 0.0) {
+            format!("{:.prec$e}", val, prec = FLOAT_DISPLAY_PRECISION)
         } else {
-            let s = format!("{:.6}", val);
+            let s = format!("{:.prec$}", val, prec = FLOAT_DISPLAY_PRECISION);
             if s.contains('.') {
                 let trimmed = s.trim_end_matches('0').trim_end_matches('.');
                 trimmed.to_string()

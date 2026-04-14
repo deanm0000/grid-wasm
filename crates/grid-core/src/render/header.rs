@@ -1,10 +1,15 @@
 use crate::canvas::CanvasCtx;
 use crate::columns::ResolvedColumns;
+use crate::layout::{self, ColumnLayout, MENU_DOT_GAP, MENU_DOT_RADIUS};
 use crate::theme::Theme;
-use crate::types::{ColDragState, GridSelection, Rectangle, SortDirection, SortState};
+use crate::types::{ColDragState, GridSelection, SortDirection, SortState};
+
 use crate::walk::{walk_columns, MappedColumn};
 
 use super::lib_utils::get_middle_center_bias;
+
+/// Alpha (opacity) of the column header ghost while a column is being dragged.
+const COL_DRAG_GHOST_ALPHA: f64 = 0.35;
 
 pub fn draw_grid_headers(
     ctx: &mut CanvasCtx,
@@ -21,6 +26,7 @@ pub fn draw_grid_headers(
     _get_group_details: impl Fn(&str) -> GroupDetails,
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
+    col_layout: &ColumnLayout,
 ) {
     let total_header_height = header_height + group_header_height;
     if total_header_height <= 0.0 {
@@ -38,18 +44,27 @@ pub fn draw_grid_headers(
     if let Some(resolved) = resolved {
         if resolved.max_depth > 1 {
             draw_multi_level_headers(
-                ctx, effective_cols, resolved, width, translate_x,
-                header_height, group_header_height, selection, sort_state,
-                theme, &font, bias, col_drag,
+                ctx,
+                effective_cols,
+                resolved,
+                width,
+                translate_x,
+                header_height,
+                group_header_height,
+                selection,
+                sort_state,
+                theme,
+                &font,
+                bias,
+                col_drag,
+                col_layout,
             );
             return;
         }
     }
 
     draw_leaf_headers(
-        ctx, effective_cols, enable_groups, width, translate_x,
-        header_height, group_header_height, selection, sort_state,
-        theme, &font, bias, resolved, col_drag,
+        ctx, width, selection, sort_state, theme, &font, bias, resolved, col_drag, col_layout,
     );
 }
 
@@ -67,6 +82,7 @@ fn draw_multi_level_headers(
     font: &str,
     bias: f64,
     col_drag: Option<&ColDragState>,
+    col_layout: &ColumnLayout,
 ) {
     let total_header_height = header_height + group_header_height;
     let level_height = total_header_height / resolved.max_depth as f64;
@@ -80,9 +96,8 @@ fn draw_multi_level_headers(
                 continue;
             }
 
-            let (span_x, span_w) = compute_span_bounds(
-                span.first_leaf, span.last_leaf, effective_cols, translate_x,
-            );
+            let (span_x, span_w) =
+                compute_span_bounds(span.first_leaf, span.last_leaf, effective_cols, translate_x);
 
             if span_x > width || span_w <= 0.0 {
                 continue;
@@ -91,16 +106,22 @@ fn draw_multi_level_headers(
             ctx.save();
             ctx.clip_rect(span_x, y, span_w, h);
 
-            let bg = span.style.as_ref()
+            let bg = span
+                .style
+                .as_ref()
                 .and_then(|s| s.bg_color.as_deref())
                 .unwrap_or(&theme.bg_header);
             ctx.set_fill_style(bg);
             ctx.fill_rect(span_x, y, span_w, h);
 
-            let text_color = span.style.as_ref()
+            let text_color = span
+                .style
+                .as_ref()
                 .and_then(|s| s.color.as_deref())
                 .unwrap_or(&theme.text_header);
-            let text_font = span.style.as_ref()
+            let text_font = span
+                .style
+                .as_ref()
                 .and_then(|s| s.font.as_deref())
                 .unwrap_or(font);
 
@@ -112,6 +133,26 @@ fn draw_multi_level_headers(
             let _ = ctx.fill_text(&span.title, text_x, text_y);
 
             ctx.restore();
+
+            // Draw ⋮ button if this span has a menu entry
+            if let Some(span_entry) = col_layout.span_menus.iter().find(|s| {
+                s.level_idx == level_idx
+                    && s.first_leaf == span.first_leaf
+                    && s.last_leaf == span.last_leaf
+            }) {
+                ctx.set_fill_style(&theme.text_header);
+                for i in -1i32..=1 {
+                    ctx.begin_path();
+                    let _ = ctx.arc(
+                        span_entry.menu_btn_cx,
+                        span_entry.menu_btn_cy + i as f64 * MENU_DOT_GAP,
+                        MENU_DOT_RADIUS,
+                        0.0,
+                        std::f64::consts::TAU,
+                    );
+                    ctx.fill();
+                }
+            }
 
             ctx.set_stroke_style(&theme.border_color);
             ctx.set_line_width(1.0);
@@ -127,24 +168,23 @@ fn draw_multi_level_headers(
         }
     }
 
-    let leaf_y = (resolved.max_depth - 1) as f64 * level_height;
-    let leaf_h = level_height;
-
-    draw_leaf_row(
-        ctx, effective_cols, width, translate_x, leaf_y, leaf_h,
-        selection, sort_state, theme, font, bias, Some(resolved),
+    draw_leaf_row_from_layout(
+        ctx,
+        width,
+        selection,
+        sort_state,
+        theme,
+        font,
+        bias,
+        Some(resolved),
         col_drag,
+        col_layout,
     );
 }
 
 fn draw_leaf_headers(
     ctx: &mut CanvasCtx,
-    effective_cols: &[MappedColumn],
-    enable_groups: bool,
     width: f64,
-    translate_x: f64,
-    header_height: f64,
-    group_header_height: f64,
     selection: &GridSelection,
     sort_state: &SortState,
     theme: &Theme,
@@ -152,24 +192,16 @@ fn draw_leaf_headers(
     bias: f64,
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
+    col_layout: &ColumnLayout,
 ) {
-    let y = if enable_groups { group_header_height } else { 0.0 };
-    let h = header_height - y;
-
-    draw_leaf_row(
-        ctx, effective_cols, width, translate_x, y, h,
-        selection, sort_state, theme, font, bias, resolved,
-        col_drag,
+    draw_leaf_row_from_layout(
+        ctx, width, selection, sort_state, theme, font, bias, resolved, col_drag, col_layout,
     );
 }
 
-fn draw_leaf_row(
+fn draw_leaf_row_from_layout(
     ctx: &mut CanvasCtx,
-    effective_cols: &[MappedColumn],
     width: f64,
-    translate_x: f64,
-    y: f64,
-    h: f64,
     selection: &GridSelection,
     sort_state: &SortState,
     theme: &Theme,
@@ -177,121 +209,135 @@ fn draw_leaf_row(
     bias: f64,
     resolved: Option<&ResolvedColumns>,
     col_drag: Option<&ColDragState>,
+    col_layout: &ColumnLayout,
 ) {
-    walk_columns(
-        effective_cols,
-        0,
-        translate_x,
-        0.0,
-        y + h,
-        |c, draw_x, _draw_y, clip_x, _start_row| {
-            let diff = if clip_x > draw_x { clip_x - draw_x } else { 0.0 };
-            let x = draw_x + diff;
-            let w = c.width - diff;
+    let y = col_layout.leaf_y;
+    let h = col_layout.leaf_h;
+    let tri_size = layout::tri_size();
 
-            if x > width || w <= 0.0 {
-                return false;
-            }
+    for entry in &col_layout.entries {
+        let x = entry.draw_x;
+        let w = entry.width;
 
-            ctx.save();
-            ctx.clip_rect(x, y, w, h);
+        if x > width || w <= 0.0 {
+            continue;
+        }
 
-            let is_being_dragged = col_drag
-                .map_or(false, |d| d.has_activated && d.col_display_index == c.source_index);
-            if is_being_dragged {
-                ctx.set_global_alpha(0.35);
-            }
+        ctx.save();
+        
+        ctx.clip_rect(x, y, w, h);
 
-            let is_selected = selection.columns.contains(&(c.source_index as i32));
-            let has_selected_cell = selection.current.as_ref()
-                .map_or(false, |s| s.cell.col == c.source_index as i32);
+        let is_being_dragged = col_drag.map_or(false, |d| {
+            d.has_activated && d.col_display_index == entry.source_index
+        });
+        if is_being_dragged {
+            ctx.set_global_alpha(COL_DRAG_GHOST_ALPHA);
+        }
 
-            let leaf = resolved.and_then(|r| r.leaf_by_display_index(c.source_index));
+        let is_selected = selection.columns.contains(&(entry.source_index as i32));
+        let has_selected_cell = selection
+            .current
+            .as_ref()
+            .map_or(false, |s| s.cell.col == entry.source_index as i32);
 
-            let bg = if is_selected {
-                &theme.accent_color
-            } else if has_selected_cell {
-                &theme.bg_header_has_focus
-            } else {
-                leaf.and_then(|l| l.header_style.as_ref())
-                    .and_then(|s| s.bg_color.as_deref())
-                    .unwrap_or(&theme.bg_header)
-            };
-            ctx.set_fill_style(bg);
-            ctx.fill_rect(x, y, w, h);
+        let leaf = resolved.and_then(|r| r.leaf_by_display_index(entry.source_index));
 
-            let text_color = if is_selected {
-                &theme.text_header_selected
-            } else {
-                leaf.and_then(|l| l.header_style.as_ref())
-                    .and_then(|s| s.color.as_deref())
-                    .unwrap_or(&theme.text_header)
-            };
-            let text_font = leaf.and_then(|l| l.header_style.as_ref())
-                .and_then(|s| s.font.as_deref())
-                .unwrap_or(font);
+        let bg = if is_selected {
+            &theme.accent_color
+        } else if has_selected_cell {
+            &theme.bg_header_has_focus
+        } else {
+            leaf.and_then(|l| l.header_style.as_ref())
+                .and_then(|s| s.bg_color.as_deref())
+                .unwrap_or(&theme.bg_header)
+        };
+        ctx.set_fill_style(bg);
+        ctx.fill_rect(x, y, w, h);
 
-            ctx.set_fill_style(text_color);
-            ctx.set_font(text_font);
-            ctx.set_text_align("left");
+        let text_color = if is_selected {
+            &theme.text_header_selected
+        } else {
+            leaf.and_then(|l| l.header_style.as_ref())
+                .and_then(|s| s.color.as_deref())
+                .unwrap_or(&theme.text_header)
+        };
+        let text_font = leaf
+            .and_then(|l| l.header_style.as_ref())
+            .and_then(|s| s.font.as_deref())
+            .unwrap_or(font);
 
-            let tri_area = 16.0;
-            let text_x = x + theme.cell_horizontal_padding;
-            let text_y = y + h / 2.0 + bias;
-            let text_max = w - theme.cell_horizontal_padding * 2.0 - tri_area;
-            if text_max > 0.0 {
-                let _ = ctx.fill_text(&c.title, text_x, text_y);
-            }
+        ctx.set_fill_style(text_color);
+        ctx.set_font(text_font);
+        ctx.set_text_align("left");
 
-            let is_sort_active = sort_state.column == Some(c.source_index);
-            let tri_padding = 6.0;
-            let tri_size = 7.0;
-            let tri_gap = 3.0;
-            let tri_cx = x + w - tri_padding - tri_size;
-            let tri_center_y = y + h / 2.0;
-            let up_cy = tri_center_y - tri_size / 2.0 - tri_gap / 2.0;
-            let down_cy = tri_center_y + tri_size / 2.0 + tri_gap / 2.0;
+        let right_reserved = layout::header_right_reserved_width();
+        let text_x = x + theme.cell_horizontal_padding;
+        let text_y = y + h / 2.0 + bias;
+        let text_max = w - theme.cell_horizontal_padding * 2.0 - right_reserved;
 
-            let indicator_color = if is_selected {
-                &theme.text_header_selected
-            } else {
-                &theme.text_header
-            };
-            ctx.set_fill_style(indicator_color);
-            ctx.set_stroke_style(indicator_color);
+        let title = leaf.map(|l| l.display_name.as_str()).unwrap_or("");
+        if text_max > 0.0 && !title.is_empty() {
+            let _ = ctx.fill_text(title, text_x, text_y);
+        }
 
-            if is_sort_active {
-                match sort_state.direction {
-                    Some(SortDirection::Ascending) => {
-                        draw_triangle_up(ctx, tri_cx, up_cy, tri_size, true);
-                    }
-                    Some(SortDirection::Descending) => {
-                        draw_triangle_down(ctx, tri_cx, down_cy, tri_size, true);
-                    }
-                    None => {
-                        draw_triangle_up(ctx, tri_cx, up_cy, tri_size, false);
-                        draw_triangle_down(ctx, tri_cx, down_cy, tri_size, false);
-                    }
+        let is_sort_active = sort_state.column == Some(entry.source_index);
+
+        let indicator_color = if is_selected {
+            &theme.text_header_selected
+        } else {
+            &theme.text_header
+        };
+        ctx.set_fill_style(indicator_color);
+        ctx.set_stroke_style(indicator_color);
+        
+        if is_sort_active {
+            match sort_state.direction {
+                Some(SortDirection::Ascending) => {
+                    draw_triangle_up(ctx, entry.tri_up_cx, entry.tri_up_cy, tri_size, true);
                 }
-            } else {
-                draw_triangle_up(ctx, tri_cx, up_cy, tri_size, false);
-                draw_triangle_down(ctx, tri_cx, down_cy, tri_size, false);
+                Some(SortDirection::Descending) => {
+                    draw_triangle_down(ctx, entry.tri_down_cx, entry.tri_down_cy, tri_size, true);
+                }
+                None => {
+                    draw_triangle_up(ctx, entry.tri_up_cx, entry.tri_up_cy, tri_size, false);
+                    draw_triangle_down(ctx, entry.tri_down_cx, entry.tri_down_cy, tri_size, false);
+                }
             }
+        } else {
+            draw_triangle_up(ctx, entry.tri_up_cx, entry.tri_up_cy, tri_size, false);
+            draw_triangle_down(ctx, entry.tri_down_cx, entry.tri_down_cy, tri_size, false);
+        }
 
-            ctx.restore();
+        // Draw 3-dot menu button (⋮)
+        let dot_color = if is_selected {
+            &theme.text_header_selected
+        } else {
+            &theme.text_header
+        };
+        ctx.set_fill_style(dot_color);
+        for i in -1i32..=1 {
+            ctx.begin_path();
+            let _ = ctx.arc(
+                entry.menu_btn_cx,
+                entry.menu_btn_cy + i as f64 * MENU_DOT_GAP,
+                MENU_DOT_RADIUS,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            ctx.fill();
+        }
 
-            if c.source_index > 0 {
-                ctx.set_stroke_style(&theme.border_color);
-                ctx.set_line_width(1.0);
-                ctx.begin_path();
-                ctx.move_to(x + 0.5, y);
-                ctx.line_to(x + 0.5, y + h);
-                ctx.stroke();
-            }
-
-            false
-        },
-    );
+        ctx.restore();
+        
+        if entry.source_index > 0 {
+            ctx.set_stroke_style(&theme.border_color);
+            ctx.set_line_width(1.0);
+            ctx.begin_path();
+            ctx.move_to(x + 0.5, y);
+            ctx.line_to(x + 0.5, y + h);
+            ctx.stroke();
+        }
+    }
 }
 
 fn compute_span_bounds(
@@ -348,118 +394,6 @@ fn draw_triangle_down(ctx: &CanvasCtx, cx: f64, cy: f64, size: f64, filled: bool
         ctx.set_line_width(1.0);
         ctx.stroke();
     }
-}
-
-/// Compute the leaf row y and h using the same geometry as the renderers.
-pub fn leaf_row_geometry(
-    header_height: f64,
-    group_header_height: f64,
-    resolved: Option<&ResolvedColumns>,
-) -> (f64, f64) {
-    if let Some(r) = resolved {
-        if r.max_depth > 1 {
-            let total = header_height + group_header_height;
-            let level_h = total / r.max_depth as f64;
-            let leaf_y = (r.max_depth - 1) as f64 * level_h;
-            return (leaf_y, level_h);
-        }
-    }
-    // Single level: leaf row starts at group_header_height
-    let y = group_header_height;
-    let h = header_height - group_header_height;
-    (y, h)
-}
-
-pub fn hit_test_sort_triangle(
-    px: f64,
-    py: f64,
-    col: usize,
-    effective_cols: &[MappedColumn],
-    header_height: f64,
-    group_header_height: f64,
-    translate_x: f64,
-    resolved: Option<&ResolvedColumns>,
-) -> Option<bool> {
-    let mut x: f64 = 0.0;
-    let mut clip_x: f64 = 0.0;
-    let mut col_x = None;
-    let mut col_w = 0.0f64;
-
-    for c in effective_cols {
-        let draw_x = if c.sticky { clip_x } else { x + translate_x };
-        if c.source_index == col {
-            col_x = Some(draw_x);
-            col_w = c.width;
-            break;
-        }
-        x += c.width;
-        if c.sticky {
-            clip_x += c.width;
-        }
-    }
-
-    let col_x = col_x?;
-    let (y, h) = leaf_row_geometry(header_height, group_header_height, resolved);
-
-    let tri_padding = 6.0;
-    let tri_size = 7.0;
-    let tri_gap = 3.0;
-    let tri_cx = col_x + col_w - tri_padding - tri_size;
-    let tri_center_y = y + h / 2.0;
-    let up_cy = tri_center_y - tri_size / 2.0 - tri_gap / 2.0;
-    let down_cy = tri_center_y + tri_size / 2.0 + tri_gap / 2.0;
-
-    let hit_pad = 3.0;
-    let up_rect = Rectangle::new(tri_cx - hit_pad, up_cy - hit_pad, tri_size + hit_pad * 2.0, tri_size + hit_pad * 2.0);
-    let down_rect = Rectangle::new(tri_cx - hit_pad, down_cy - hit_pad, tri_size + hit_pad * 2.0, tri_size + hit_pad * 2.0);
-
-    if up_rect.contains(px, py) {
-        Some(true)
-    } else if down_rect.contains(px, py) {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-pub fn hit_test_resize_border(
-    px: f64,
-    py: f64,
-    effective_cols: &[MappedColumn],
-    header_height: f64,
-    group_header_height: f64,
-    translate_x: f64,
-    buffer: f64,
-    resolved: Option<&ResolvedColumns>,
-) -> Option<usize> {
-    let total = header_height + group_header_height;
-    if py > total {
-        return None;
-    }
-    // Only detect resize in the leaf header row
-    let (leaf_y, leaf_h) = leaf_row_geometry(header_height, group_header_height, resolved);
-    if py < leaf_y || py > leaf_y + leaf_h {
-        return None;
-    }
-
-    let mut x = 0.0f64;
-    let mut clip_x = 0.0f64;
-
-    for c in effective_cols {
-        let draw_x = if c.sticky { clip_x } else { x + translate_x };
-        let right_edge = draw_x + c.width;
-
-        if (px - right_edge).abs() <= buffer && c.is_resizable {
-            return Some(c.source_index);
-        }
-
-        x += c.width;
-        if c.sticky {
-            clip_x += c.width;
-        }
-    }
-
-    None
 }
 
 pub struct GroupDetails {

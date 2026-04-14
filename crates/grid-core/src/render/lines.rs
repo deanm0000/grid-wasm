@@ -22,6 +22,8 @@ pub fn draw_grid_lines(
     theme: &Theme,
     has_append_row: bool,
 ) {
+    
+
     // Draw vertical lines between columns
     ctx.set_stroke_style(&theme.border_color);
     ctx.set_line_width(1.0);
@@ -35,6 +37,8 @@ pub fn draw_grid_lines(
         total_header_height,
         |c, draw_x, _draw_y, clip_x, _start_row| {
             let col_x = if c.sticky { draw_x } else { draw_x + 0.5 };
+
+            
 
             // Vertical line at right edge of column
             if col_x > 0.0 && col_x < width {
@@ -51,7 +55,7 @@ pub fn draw_grid_lines(
     // Draw horizontal lines between rows
     walk_rows_in_col(
         cell_y_offset,
-        total_header_height + translateY_to_f64(translate_y),
+        total_header_height + translate_y_to_f64(translate_y),
         height,
         rows,
         |_| row_height,
@@ -81,7 +85,7 @@ pub fn draw_grid_lines(
     }
 }
 
-fn translateY_to_f64(ty: f64) -> f64 {
+fn translate_y_to_f64(ty: f64) -> f64 {
     ty
 }
 
@@ -238,21 +242,9 @@ pub fn draw_blanks(
     theme: &Theme,
 ) {
     // Find the rightmost column edge
-    let mut right_edge = 0.0f64;
-    let mut clip_x = 0.0f64;
-    for c in effective_cols {
-        if c.sticky {
-            clip_x += c.width;
-        }
-    }
-    right_edge = clip_x;
-    let mut x_acc = 0.0f64;
-    for c in effective_cols {
-        if !c.sticky {
-            x_acc += c.width;
-        }
-    }
-    right_edge += x_acc + translate_x;
+    let clip_x: f64 = effective_cols.iter().filter(|c| c.sticky).map(|c| c.width).sum();
+    let x_acc: f64 = effective_cols.iter().filter(|c| !c.sticky).map(|c| c.width).sum();
+    let right_edge = clip_x + x_acc + translate_x;
 
     if right_edge >= width {
         return;

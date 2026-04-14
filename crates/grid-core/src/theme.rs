@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Default corner rounding radius in pixels used when the theme does not specify one.
+const DEFAULT_ROUNDING_RADIUS: f64 = 4.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     pub accent_color: String,
@@ -113,7 +116,7 @@ impl Theme {
     }
 
     pub fn rounding_radius(&self) -> f64 {
-        self.rounding_radius.unwrap_or(4.0)
+        self.rounding_radius.unwrap_or(DEFAULT_ROUNDING_RADIUS)
     }
 
     pub fn merge_with(&self, overrides: &ThemeOverride) -> Theme {

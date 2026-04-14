@@ -2,6 +2,15 @@ use crate::canvas::CanvasCtx;
 use crate::theme::Theme;
 use crate::types::{ContentAlign, GridCell, GridSelection, Rectangle};
 
+/// Multiplier applied to font size to compute vertical text centering bias.
+const TEXT_VERTICAL_BIAS_FACTOR: f64 = 0.35;
+/// Fallback font size in pixels when the font string cannot be parsed.
+const FALLBACK_FONT_SIZE_PX: f64 = 13.0;
+/// Sub-pixel nudge for crisp left/right-aligned text rendering.
+const TEXT_SUBPIXEL_NUDGE: f64 = 0.5;
+/// Divisor used in character-width heuristic for truncation pre-check (~4 px/char at 13 px).
+const CHAR_WIDTH_HEURISTIC_DIVISOR: f64 = 4.0;
+
 /// Draw a rounded rectangle path (does not fill/stroke).
 pub fn rounded_rect(ctx: &CanvasCtx, x: f64, y: f64, w: f64, h: f64, radius: f64) {
     let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
@@ -32,7 +41,7 @@ pub fn get_middle_center_bias(ctx: &mut CanvasCtx, font: &str) -> f64 {
         // Rough approximation based on font metrics
         // For a 13px font, typical ascent is ~10-11px
         let font_size = parse_font_size(font);
-        -(font_size * 0.35)
+        -(font_size * TEXT_VERTICAL_BIAS_FACTOR)
     } else {
         0.0
     }
@@ -47,7 +56,7 @@ fn parse_font_size(font: &str) -> f64 {
             }
         }
     }
-    13.0 // default
+    FALLBACK_FONT_SIZE_PX // default
 }
 
 /// Draw a single line of text, aligned within a cell.
@@ -67,7 +76,7 @@ pub fn draw_single_text_line(
     match align {
         Some(ContentAlign::Right) => {
             ctx.set_text_align("right");
-            let _ = ctx.fill_text(text, x + w - (theme.cell_horizontal_padding + 0.5), center_y);
+            let _ = ctx.fill_text(text, x + w - (theme.cell_horizontal_padding + TEXT_SUBPIXEL_NUDGE), center_y);
         }
         Some(ContentAlign::Center) => {
             ctx.set_text_align("center");
@@ -75,7 +84,7 @@ pub fn draw_single_text_line(
         }
         _ => {
             ctx.set_text_align("left");
-            let _ = ctx.fill_text(text, x + theme.cell_horizontal_padding + 0.5, center_y);
+            let _ = ctx.fill_text(text, x + theme.cell_horizontal_padding + TEXT_SUBPIXEL_NUDGE, center_y);
         }
     }
 }
@@ -86,7 +95,7 @@ pub fn truncate_string(ctx: &mut CanvasCtx, data: &str, w: f64, font: &str) -> S
     let first_line = data.lines().next().unwrap_or("");
 
     // Quick length heuristic
-    let max_chars = (w / 4.0) as usize;
+    let max_chars = (w / CHAR_WIDTH_HEURISTIC_DIVISOR) as usize;
     if first_line.len() > max_chars {
         first_line.chars().take(max_chars).collect()
     } else {

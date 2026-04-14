@@ -11,6 +11,7 @@ pub fn format_number(value: f64, fmt: &NumberFormat) -> String {
         NumberFormat::Decimal { decimals } => format_decimal(value, *decimals),
         NumberFormat::Integer => format_integer(value),
         NumberFormat::Date { format } => format_date(value, format),
+        NumberFormat::DateTime { format } => format_date(value, format),
     }
 }
 
@@ -58,9 +59,29 @@ fn format_integer(value: f64) -> String {
 }
 
 fn format_date(value: f64, fmt: &str) -> String {
-    let secs = value as i64;
-    let nsecs = ((value - secs as f64) * 1_000_000_000.0) as u32;
-    match chrono::DateTime::from_timestamp(secs, nsecs) {
+    // Detect the scale of the value to handle Arrow's different date/time units:
+    //   Date32 stores days since epoch      (values ~0–100,000)
+    //   Date64 stores milliseconds          (values ~0–1e12)
+    //   Timestamp (us) stores microseconds  (values ~0–1e15)
+    //   Timestamp (ns) stores nanoseconds   (values ~0–1e18)
+    //   Unix seconds                        (values ~0–2e9)
+    let secs = if value.abs() < 1e8 {
+        // Likely days (Date32) → convert to seconds
+        value as i64 * 86_400
+    } else if value.abs() < 1e11 {
+        // Likely Unix seconds — use as-is
+        value as i64
+    } else if value.abs() < 1e14 {
+        // Likely milliseconds (Date64) → convert to seconds
+        (value / 1_000.0) as i64
+    } else if value.abs() < 1e17 {
+        // Likely microseconds → convert to seconds
+        (value / 1_000_000.0) as i64
+    } else {
+        // Likely nanoseconds → convert to seconds
+        (value / 1_000_000_000.0) as i64
+    };
+    match chrono::DateTime::from_timestamp(secs, 0) {
         Some(dt) => dt.format(fmt).to_string(),
         None => value.to_string(),
     }
